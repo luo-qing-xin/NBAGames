@@ -10,10 +10,15 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Protocol
 
-from nba_pbp.cli import validate_game_id, validate_proxy, validate_timeout
-from nba_pbp.errors import NbaPbpError
-from nba_pbp.player_data import PlayerDataFetcher, collect_person_ids
-from nba_pbp.player_storage import PlayerStorageManager, ProfileCache
+from nba_pbp.common.arguments import (
+    validate_game_id,
+    validate_proxy,
+    validate_timeout,
+)
+from nba_pbp.common.errors import NbaPbpError
+from nba_pbp.players.fetcher import PlayerDataFetcher
+from nba_pbp.players.storage import PlayerStorageManager, ProfileCache
+from nba_pbp.players.transforms import collect_person_ids
 
 
 PROFILE_REQUEST_DELAY_SECONDS = 0.6

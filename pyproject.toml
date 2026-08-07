@@ -19,7 +19,7 @@ dependencies = [
 dev = ["pytest>=8,<10"]
 
 [project.scripts]
-nba-pbp = "nba_pbp.cli:main"
+nba-pbp = "nba_pbp.pbp.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

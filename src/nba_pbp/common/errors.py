@@ -1,4 +1,4 @@
-"""Application-specific exceptions."""
+"""Shared application-specific exceptions."""
 
 
 class NbaPbpError(Exception):

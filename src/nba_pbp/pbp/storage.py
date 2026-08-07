@@ -9,16 +9,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from nba_pbp.errors import ResponseValidationError, StorageError
-from nba_pbp.fetcher import FetchResult
-from nba_pbp.raw_data import extract_raw_records
-from nba_pbp.serialization import (
+from nba_pbp.common.errors import ResponseValidationError, StorageError
+from nba_pbp.common.serialization import (
     load_strict_json,
     ordered_columns,
     read_csv_shape,
     serialize_csv,
     serialize_json,
 )
+from nba_pbp.pbp.fetcher import FetchResult
+from nba_pbp.pbp.raw_data import extract_raw_records
 
 
 API_RESPONSE_FILE = "api_response_raw.json"

@@ -1,4 +1,4 @@
-"""Strict JSON and view-only CSV serialization helpers."""
+"""Shared strict JSON and view-only CSV serialization helpers."""
 
 from __future__ import annotations
 
@@ -114,4 +114,3 @@ def _csv_cell(value: Any) -> str:
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"Non-standard JSON constant: {value}")
-

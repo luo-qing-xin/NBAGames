@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from nba_pbp.errors import ResponseValidationError
+from nba_pbp.common.errors import ResponseValidationError
 
 
 def extract_raw_records(
@@ -48,4 +48,3 @@ def extract_raw_records(
         {"videoAvailable": game.get("videoAvailable", 0)}
     ]
     return play_by_play_records, available_video_records
-
