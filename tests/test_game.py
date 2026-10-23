@@ -569,3 +569,33 @@ def test_shared_http_session_is_restored_after_exception():
         raise RuntimeError("test")
     assert NBAStatsHTTP.get_session() is old_stats
     assert NBALiveHTTP.get_session() is old_live
+
+
+def test_html_200_error_is_not_reported_as_proven_ip_block(monkeypatch):
+    from curl_cffi import requests as curl_requests
+
+    from nba_pbp.common.errors import SourceBlockedError
+    from nba_pbp.common.http import StatusAwareBrowserSession, classify_error
+
+    class ErrorPage:
+        def __init__(self):
+            self.headers = {"content-type": "text/html"}
+            self.text = "<!DOCTYPE html><html>We are unable to process your request at the moment</html>"
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(
+        curl_requests.Session, "get", lambda *args, **kwargs: ErrorPage()
+    )
+    session = StatusAwareBrowserSession()
+    try:
+        with pytest.raises(SourceBlockedError) as exc:
+            session.get("https://stats.nba.com/stats/boxscoresummaryv3")
+    finally:
+        session.close()
+    disposition = classify_error(exc.value)
+    assert "尚不能确定原因" in disposition.reason
+    assert "拦截了当前网络出口" not in disposition.reason
+    assert disposition.fallback_allowed
+    assert not disposition.retryable

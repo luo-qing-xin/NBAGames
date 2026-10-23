@@ -55,9 +55,7 @@ class StatusAwareBrowserSession:
         if "text/html" in content_type or prefix.startswith(
             ("<!doctype html", "<html")
         ):
-            raise SourceBlockedError(
-                "NBA 返回了 HTML 拦截页，而不是 API JSON"
-            )
+            raise SourceBlockedError("NBA 返回了 HTML 页面，而不是 API JSON")
         return response
 
     def close(self) -> None:
@@ -89,19 +87,15 @@ def classify_error(exc: Exception) -> ErrorDisposition:
         return ErrorDisposition(
             False,
             True,
-            "NBA 拦截了当前网络出口（返回 HTML 页面）",
+            "NBA 返回了 HTML 错误页（可能是接口临时异常或访问限制，尚不能确定原因）",
         )
     if isinstance(exc, (requests.HTTPError, curl_exceptions.HTTPError)):
         response = getattr(exc, "response", None)
         status = getattr(response, "status_code", None)
         if status == 429:
-            return ErrorDisposition(
-                True, True, "NBA API 返回 HTTP 429（请求过于频繁）"
-            )
+            return ErrorDisposition(True, True, "NBA API 返回 HTTP 429（请求过于频繁）")
         if status == 403:
-            return ErrorDisposition(
-                False, True, "NBA 拦截了当前网络出口（HTTP 403）"
-            )
+            return ErrorDisposition(False, True, "NBA 拒绝了当前请求（HTTP 403）")
         if status is not None and 500 <= status <= 599:
             return ErrorDisposition(True, True, f"NBA API 返回 HTTP {status}")
         if status is not None and 400 <= status <= 499:
@@ -121,9 +115,7 @@ def classify_error(exc: Exception) -> ErrorDisposition:
         return ErrorDisposition(
             False, False, "缺少 nba_api 或 curl_cffi 运行依赖，请重新安装项目"
         )
-    return ErrorDisposition(
-        False, False, f"请求 NBA API 失败（{type(exc).__name__}）"
-    )
+    return ErrorDisposition(False, False, f"请求 NBA API 失败（{type(exc).__name__}）")
 
 
 def proxy_is_configured(proxy: str | None) -> bool:

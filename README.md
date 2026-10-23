@@ -116,7 +116,8 @@ Stats 逐回合失败时额外请求 NBA Live CDN；Summary 或 Traditional 失�
 
 ## 常见问题
 
-- **HTML 拦截页、403、持续超时**：当前出口可能被 `stats.nba.com` 限制。使用 `--proxy`，仍被拦截则更换可访问 NBA Stats 的节点。CDN 可用不代表 Stats 可用。
+- **HTTP 200 但正文为 HTML**：可能是 NBA 接口临时异常或访问限制，不能仅凭 HTML 判定 IP 被封。[上游曾报告同样现象并自行恢复](https://github.com/swar/nba_api/issues/696)。先在浏览器打开 `https://stats.nba.com/stats/boxscoresummaryv3?GameID=0022300001`，核对是否能看到 JSON，再尝试不同网络或代理节点；同样的 HTML 错误持续出现时应稍后重试。CDN 可用不代表 Stats 可用。
+- **403、持续超时**：当前请求可能受访问限制。检查 `stats.nba.com` 的代理路由，尝试不同网络或节点；更长的超时不能解决明确的拒绝响应。
 - **429**：等待后重跑，避免并行采集多个比赛。
 - **ID 错误**：确认使用 10 位 NBA GameID 并保留前导零。
 - **未开赛或历史数据为空**：原始响应和清单会区分合法空数据与请求失败。
