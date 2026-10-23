@@ -8,7 +8,7 @@ import re
 from urllib.parse import urlsplit
 
 
-GAME_ID_PATTERN = re.compile(r"^\d{10}$")
+GAME_ID_PATTERN = re.compile(r"^[0-9]{10}$")
 PROXY_SCHEMES = {
     "http",
     "https",

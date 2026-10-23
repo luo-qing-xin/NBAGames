@@ -10,4 +10,3 @@ venv/
 dist/
 build/
 data/
-tests/
