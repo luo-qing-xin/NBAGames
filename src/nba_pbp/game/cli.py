@@ -10,6 +10,7 @@ from pathlib import Path
 from nba_pbp.common.arguments import validate_game_id, validate_proxy, validate_timeout
 from nba_pbp.common.errors import NbaPbpError
 from nba_pbp.game.collector import Collector
+from nba_pbp.game.diagnostics import check_network
 
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[3] / "data" / "output"
 
@@ -31,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--proxy",
         type=validate_proxy,
         default=None,
-        help="HTTP/HTTPS/SOCKS 代理，默认读取环境变量",
+        help="HTTP/HTTPS/SOCKS 代理，默认读取环境变量或系统代理",
     )
     parser.add_argument(
         "--timeout",
@@ -42,6 +43,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force", action="store_true", help="忽略缓存，重新抓取全部数据和档案"
     )
+    parser.add_argument(
+        "--check-network",
+        action="store_true",
+        help="仅检查 NBA Stats 与 CDN 是否返回有效 JSON，不修改存档",
+    )
     return parser
 
 
@@ -49,6 +55,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     directory = args.output_dir / args.game_id
     try:
+        if args.check_network:
+            return check_network(
+                args.game_id, timeout=args.timeout, proxy=args.proxy
+            )
         collector = Collector(
             args.game_id,
             args.output_dir,
@@ -73,6 +83,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("球员名单覆盖不完整，请查看 manifest.json。", file=sys.stderr)
     if counts["empty_resources"]:
         print("合法空结果：" + ", ".join(counts["empty_resources"]))
+    fallbacks = [
+        key
+        for key, entry in report["resources"].items()
+        if entry.get("source") == "nba_live_cdn"
+        and entry.get("status") in ("success", "empty")
+    ]
+    if fallbacks:
+        print("官方 CDN 已保存：" + ", ".join(fallbacks))
+    if report.get("stats_unavailable"):
+        print(
+            "Stats 源暂不可用，未请求的资源已标记 skipped=true、attempts=0；"
+            "网络恢复后重新运行原命令即可补抓，无需 --force。",
+            file=sys.stderr,
+        )
     if report["status"] == "complete":
         print(f"抓取完成：{directory}")
         return 0

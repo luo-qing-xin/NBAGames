@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -35,6 +34,11 @@ class StatusAwareBrowserSession:
         )
 
     def get(self, url: str, **kwargs: Any) -> Any:
+        # curl/libcurl does not discover macOS system proxies. requests uses
+        # urllib's platform-aware discovery and also applies NO_PROXY/system
+        # bypass rules. Keep nba_api's explicit --proxy mapping authoritative.
+        if kwargs.get("proxies") is None and kwargs.get("proxy") is None:
+            kwargs["proxies"] = {"all": _default_proxy(url) or ""}
         headers = kwargs.get("headers")
         if isinstance(headers, Mapping):
             browser_managed = {
@@ -55,7 +59,13 @@ class StatusAwareBrowserSession:
         if "text/html" in content_type or prefix.startswith(
             ("<!doctype html", "<html")
         ):
-            raise SourceBlockedError("NBA 返回了 HTML 页面，而不是 API JSON")
+            raise SourceBlockedError(
+                "NBA 返回了 HTML 页面，而不是 API JSON",
+                status_code=getattr(response, "status_code", None),
+                akamai=(
+                    response.headers.get("server", "").lower() == "akamainetstorage"
+                ),
+            )
         return response
 
     def close(self) -> None:
@@ -84,10 +94,19 @@ def nba_http_session() -> Iterator[None]:
 def classify_error(exc: Exception) -> ErrorDisposition:
     """Classify an endpoint failure without exposing sensitive details."""
     if isinstance(exc, SourceBlockedError):
+        details = []
+        if exc.status_code is not None:
+            details.append(f"HTTP {exc.status_code}")
+        if exc.akamai:
+            details.append("AkamaiNetStorage")
+        detail = "；".join(details)
+        if detail:
+            detail += "；"
         return ErrorDisposition(
             False,
             True,
-            "NBA 返回了 HTML 错误页（可能是接口临时异常或访问限制，尚不能确定原因）",
+            f"NBA 返回了 HTML 错误页（{detail}"
+            "可能是接口临时异常或访问限制，尚不能确定原因）",
         )
     if isinstance(exc, (requests.HTTPError, curl_exceptions.HTTPError)):
         response = getattr(exc, "response", None)
@@ -118,18 +137,11 @@ def classify_error(exc: Exception) -> ErrorDisposition:
     return ErrorDisposition(False, False, f"请求 NBA API 失败（{type(exc).__name__}）")
 
 
+def _default_proxy(url: str) -> str | None:
+    """Resolve environment or OS proxies for this URL, including bypass rules."""
+    return requests.utils.select_proxy(url, requests.utils.get_environ_proxies(url))
+
+
 def proxy_is_configured(proxy: str | None) -> bool:
-    """Return whether an explicit or environment proxy is configured."""
-    if proxy:
-        return True
-    return any(
-        os.environ.get(name)
-        for name in (
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-        )
-    )
+    """Report the effective Stats route without exposing proxy credentials."""
+    return bool(proxy or _default_proxy("https://stats.nba.com/"))

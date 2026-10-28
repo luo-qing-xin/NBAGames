@@ -145,6 +145,8 @@ class Fetcher:
         )
 
     def _request_cdn_once(self, game_id: str) -> FetchResult:
+        from pandas import DataFrame
+
         endpoint_factory = (
             self._live_endpoint_factory or _load_live_endpoint_factory()
         )
@@ -158,7 +160,8 @@ class Fetcher:
         return self._build_result(
             game_id=game_id,
             response=response,
-            play_by_play_frame=response.actions.get_data_frame(),
+            # Live DataSet exposes records via get_dict(), unlike Stats DataSet.
+            play_by_play_frame=DataFrame(response.actions.get_dict()),
             available_video_frame=None,
             data_source="nba_live_cdn",
             endpoint=(

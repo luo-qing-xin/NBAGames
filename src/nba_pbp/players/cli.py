@@ -67,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=validate_proxy,
         default=None,
         metavar="URL",
-        help="HTTP/HTTPS/SOCKS 代理 URL（默认使用代理环境变量）",
+        help="HTTP/HTTPS/SOCKS 代理 URL（默认使用环境变量或系统代理）",
     )
     return parser
 

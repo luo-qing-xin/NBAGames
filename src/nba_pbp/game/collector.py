@@ -175,7 +175,11 @@ class Collector:
                     fetched_at=previous.get("fetched_at", file_time(path)),
                 )
             else:
-                self.progress(f"正在抓取：{key}")
+                if not (
+                    source == "nba_stats"
+                    and getattr(self.transport, "stats_paused", False)
+                ):
+                    self.progress(f"正在抓取：{key}")
                 response = self.transport.fetch(resource, self.game_id, person_id)
                 entry.update(attempts=response.attempts, parameters=response.parameters)
                 raw = response.raw
@@ -210,7 +214,13 @@ class Collector:
                 entry["parameters"] = exc.parameters
             if path.is_file():
                 entry["retained_previous_file"] = str(path.relative_to(self.directory))
-            self.progress(f"未完成：{key}（{reason}）")
+            if getattr(exc, "skipped", False):
+                entry["skipped"] = True
+                if "stats_unavailable" not in self.report:
+                    self.report["stats_unavailable"] = reason
+                    self.progress(reason)
+            else:
+                self.progress(f"未完成：{key}（{reason}）")
             raw = None
         self.report["resources"][key] = entry
         self.checkpoint()

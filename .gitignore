@@ -1,12 +1,30 @@
+# OS / editor
 .DS_Store
+.idea/
+
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+.eggs/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 .venv/
 venv/
 dist/
 build/
-data/
+*.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Downloaded datasets and generated outputs
+/data/

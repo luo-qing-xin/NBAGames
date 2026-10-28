@@ -26,6 +26,9 @@ uv run python src/fetch_game.py 0022300001
 uv run python src/fetch_game.py 0022300001 --proxy http://localhost:11888
 uv run python src/fetch_game.py 0022300001 --proxy socks5h://localhost:11889
 
+# 切换节点后先检查 Stats 与 CDN，检查不会创建或修改比赛存档
+uv run python src/fetch_game.py 0022300001 --proxy http://localhost:11888 --check-network
+
 # 自定义输出根目录，其下自动追加比赛 ID
 uv run python src/fetch_game.py 0022300001 --output-dir ./archive --timeout 60
 
@@ -40,7 +43,9 @@ uv run python -m nba_pbp.game 0022300001
 uv run nba-game 0022300001
 ```
 
-未指定 `--proxy` 时，传输层读取 `HTTPS_PROXY`、`ALL_PROXY` 等标准代理环境变量。显式参数优先，代理 URL 和凭据不写入日志或状态清单。
+未指定 `--proxy` 时，传输层读取 `HTTPS_PROXY`、`ALL_PROXY` 等标准代理环境变量；无代理环境配置时读取操作系统代理（包括 macOS 系统设置中的 HTTP/HTTPS 代理）。自动选择遵守 `NO_PROXY` 和系统绕过规则。显式参数优先，代理 URL 和凭据不写入日志或状态清单。系统代理需要保持运行；PAC 自动配置脚本不会由此工具执行。
+
+在 macOS 上，仅开启系统代理而不导出环境变量时，旧版脚本可能仍然直连 Stats。当前版本已补上系统代理发现，可直接运行默认命令；也可用 `--proxy` 显式指定代理验证路线。`manifest.json` 的 `proxy_configured` 会包含自动发现的 Stats 代理。
 
 ## 默认采集清单
 
@@ -95,6 +100,8 @@ raw/profile 文件保留接口完整 JSON 对象，包括未知字段、嵌套�
 
 请求串行执行，开始时间至少间隔 1 秒。连接错误、超时、HTTP 429、5xx 和无效 JSON 最多尝试两次，采用指数退避和随机抖动。403 和 HTML 拦截页不在同源重复请求。
 
+若两个不同的 Stats 接口连续返回 HTML，本次运行暂停后续 Stats 网络请求（含球员档案），继续读取有效缓存并处理官方 CDN 备用源。中间有 Stats JSON 成功响应时重新计数，单个接口失败或重复调用同一个失败接口不会触发暂停。未发出的请求在清单中仍为 `failed`，另标注 `skipped=true`、`attempts=0`，不会冒充抓取成功。下次运行自动重新检查 Stats，并补抓缺项。
+
 Stats 逐回合失败时额外请求 NBA Live CDN；Summary 或 Traditional 失败时额外请求 Live BoxScore。备用响应独立保存，并标注 `nba_live_cdn` 来源。
 
 **备用源不代表原 Stats 接口成功，也不能补齐所有高级统计或未激活名单。** 原接口缺项仍保留在清单中。名单部分可用时先抓已知球员档案，并标记 `roster_complete=false`。
@@ -116,7 +123,7 @@ Stats 逐回合失败时额外请求 NBA Live CDN；Summary 或 Traditional 失�
 
 ## 常见问题
 
-- **HTTP 200 但正文为 HTML**：可能是 NBA 接口临时异常或访问限制，不能仅凭 HTML 判定 IP 被封。[上游曾报告同样现象并自行恢复](https://github.com/swar/nba_api/issues/696)。先在浏览器打开 `https://stats.nba.com/stats/boxscoresummaryv3?GameID=0022300001`，核对是否能看到 JSON，再尝试不同网络或代理节点；同样的 HTML 错误持续出现时应稍后重试。CDN 可用不代表 Stats 可用。
+- **HTTP 200 但正文为 HTML**：可能是 NBA 接口临时异常或访问限制，不能仅凭 HTML 判定 IP 被封。[上游曾报告同样现象并自行恢复](https://github.com/swar/nba_api/issues/696)。错误提示会注明 HTTP 状态及是否为 `AkamaiNetStorage` 页面。先使用原命令追加 `--check-network`，通过相同代理分别验证 Stats 与 CDN 的 JSON 和比赛 ID，不写入存档。再检查代理软件中 `stats.nba.com` 的路由并尝试不同网络或节点；同样的 HTML 持续出现时应稍后重试。CDN 或 NBA 官网可用不代表 Stats 可用，也不能靠延长超时或反复重试恢复数据。网络恢复后重新运行原命令即可补抓，无需 `--force`。
 - **403、持续超时**：当前请求可能受访问限制。检查 `stats.nba.com` 的代理路由，尝试不同网络或节点；更长的超时不能解决明确的拒绝响应。
 - **429**：等待后重跑，避免并行采集多个比赛。
 - **ID 错误**：确认使用 10 位 NBA GameID 并保留前导零。
@@ -130,6 +137,16 @@ uv run --extra dev pytest
 ```
 
 自动测试禁止访问网络，覆盖接口调度、投篮参数、原始字段保留、球员去重、缓存补抓、状态刷新、备用源、原子写入和错误处理。真实 NBA 请求用统一命令单独验证，结果以实际 `manifest.json` 为准。
+
+也可从 Stats 的真实比赛池做可复现的随机联网测试：
+
+```bash
+uv run python scripts/validate_stats_sample.py --seed 20261028 --timeout 60
+```
+
+默认从 2023–24、2024–25、2025–26 三个赛季的已完成常规赛中各随机抽取一场，每个比赛 ID 只进入候选池一次。抽样在抓取前固定，不会替换失败样本。比赛保存到 `data/output/<比赛ID>/`，候选池、随机种子和检查报告保存到 `data/validation/stats-random-sample/`。可用 `--seasons`、`--output-dir`、`--report-dir`、`--proxy` 和 `--force` 调整运行。
+
+联网检查要求 13 个 Stats 资源均有数据、球员档案身份与摘要正确、关键统计字段有值、Summary／Traditional／PBP 的最终比分一致，以及 ShotChart 出手数等于 Traditional 的运动战出手总数。不会把 CDN 替代、合法空表或有缺项的结果算作全部通过；每场报告会列出缓存命中数。GameRotation 曾出现服务端 500 或超时，即使其他 Stats 接口正常也可能失败；保留失败状态，稍后正常重跑可只补抓缺项。[上游状态说明](https://github.com/swar/nba_api/blob/master/docs/nba_api/stats/endpoint_guide.md)
 
 ## 保留的独立命令
 
