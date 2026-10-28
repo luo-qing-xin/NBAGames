@@ -3,15 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nba-pbp"
-version = "0.1.0"
-description = "Reliably fetch and archive raw NBA play-by-play and player data."
+name = "nba-game"
+version = "0.2.0"
+description = "Collect and archive complete available NBA single-game data."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "nba_api==1.11.6",
     "curl_cffi==0.15.0",
-    "pandas>=2.0,<3",
     "requests>=2.31,<3",
 ]
 
@@ -19,8 +18,7 @@ dependencies = [
 dev = ["pytest>=8,<10"]
 
 [project.scripts]
-nba-pbp = "nba_pbp.pbp.cli:main"
-nba-game = "nba_pbp.game.cli:main"
+nba-game = "nba_game.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

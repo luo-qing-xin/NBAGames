@@ -401,13 +401,12 @@ wheels = [
 ]
 
 [[package]]
-name = "nba-pbp"
-version = "0.1.0"
+name = "nba-game"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "curl-cffi" },
     { name = "nba-api" },
-    { name = "pandas" },
     { name = "requests" },
 ]
 
@@ -420,7 +419,6 @@ dev = [
 requires-dist = [
     { name = "curl-cffi", specifier = "==0.15.0" },
     { name = "nba-api", specifier = "==1.11.6" },
-    { name = "pandas", specifier = ">=2.0,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<10" },
     { name = "requests", specifier = ">=2.31,<3" },
 ]

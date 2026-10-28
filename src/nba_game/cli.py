@@ -7,12 +7,12 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from nba_pbp.common.arguments import validate_game_id, validate_proxy, validate_timeout
-from nba_pbp.common.errors import NbaPbpError
-from nba_pbp.game.collector import Collector
-from nba_pbp.game.diagnostics import check_network
+from nba_game.arguments import validate_game_id, validate_proxy, validate_timeout
+from nba_game.collector import Collector
+from nba_game.diagnostics import check_network
+from nba_game.errors import NbaGameError
 
-DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[3] / "data" / "output"
+DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[2] / "data" / "games"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_ROOT,
-        help="输出根目录（默认：项目的 data/output，其下自动追加比赛 ID）",
+        help="输出根目录（默认：项目的 data/games，其下自动追加比赛 ID）",
     )
     parser.add_argument(
         "--proxy",
@@ -56,9 +56,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     directory = args.output_dir / args.game_id
     try:
         if args.check_network:
-            return check_network(
-                args.game_id, timeout=args.timeout, proxy=args.proxy
-            )
+            return check_network(args.game_id, timeout=args.timeout, proxy=args.proxy)
         collector = Collector(
             args.game_id,
             args.output_dir,
@@ -70,13 +68,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print(f"已中断，成功进度已保存：{directory}", file=sys.stderr)
         return 1
-    except (NbaPbpError, OSError) as exc:
-        message = str(exc) if isinstance(exc, NbaPbpError) else "无法访问输出目录"
+    except (NbaGameError, OSError) as exc:
+        message = str(exc) if isinstance(exc, NbaGameError) else "无法访问输出目录"
         print(f"抓取失败：{message}", file=sys.stderr)
         return 1
     counts = report["summary"]
     print(
-        f"比赛接口：{counts['game_resources_succeeded']}/13；"
+        f"比赛接口：{counts['game_resources_succeeded']}/{counts['game_resources_expected']}；"
         f"球员档案：{counts['profiles_succeeded']}/{counts['profiles_expected']}"
     )
     if not report["profiles"]["roster_complete"]:
@@ -90,7 +88,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         and entry.get("status") in ("success", "empty")
     ]
     if fallbacks:
-        print("官方 CDN 已保存：" + ", ".join(fallbacks))
+        print("官方 Live 数据已保存：" + ", ".join(fallbacks))
     if report.get("stats_unavailable"):
         print(
             "Stats 源暂不可用，未请求的资源已标记 skipped=true、attempts=0；"
@@ -101,7 +99,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"抓取完成：{directory}")
         return 0
     print(
-        f"部分数据未完成，已保存成功结果与缺项清单：{directory / 'manifest.json'}",
+        f"部分数据未完成，已保存成功结果与缺项说明：{directory / 'summary.md'}",
         file=sys.stderr,
     )
     return 1

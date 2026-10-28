@@ -5,24 +5,41 @@ import json
 import os
 from itertools import pairwise
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 import requests
 
-from nba_pbp.common.errors import ResponseValidationError, StorageError
-from nba_pbp.game import cli
-from nba_pbp.game.collector import Collector
-from nba_pbp.game.resources import (
+from nba_game import cli
+from nba_game.collector import Collector
+from nba_game.errors import ResponseValidationError, StorageError
+from nba_game.sources.live import LIVE_BOX, LIVE_PBP
+from nba_game.sources.stats import (
     BY_NAME,
+    LINEUP_SHOTS,
+    LINEUPS,
     PROFILE,
     RESOURCES,
     game_season,
-    inspect_response,
 )
-from nba_pbp.game.storage import atomic_json
-from nba_pbp.game.transport import RequestFailure, Response, Transport
+from nba_game.storage import atomic_json
+from nba_game.transport import RequestFailure, Response, Transport
+from nba_game.validation import KEY_FIELDS, inspect_response
 
 GAME = "0022300001"
+
+
+def game_keys():
+    return (
+        [r.name for r in RESOURCES[:2]]
+        + [LIVE_BOX.name, LIVE_PBP.name]
+        + [r.name for r in RESOURCES[2:]]
+        + [
+            resource.key()
+            for tid in (10, 20)
+            for resource in (LINEUPS.bind(tid), LINEUP_SHOTS.bind(tid, "-1-2-3-4-5-"))
+        ]
+    )
 
 
 def dataset(name, headers, rows):
@@ -40,21 +57,55 @@ def payload(resource, *, status=3, person_id=None):
             ],
             "unknownProfileField": {"keep": True},
         }
+    if resource.module == "dunkscoreleaders":
+        return {"params": {"GameID": GAME}, "dunks": [{"gameId": GAME, "eventNum": 1}]}
+    if resource.module == "teamdashlineups":
+        return {
+            "parameters": {"GameID": GAME, "TeamID": resource.team_id},
+            "resultSets": [
+                dataset("Overall", ["TEAM_ID", "GP"], [[resource.team_id, 1]]),
+                dataset("Lineups", ["GP", "GROUP_ID"], [[1, "-1-2-3-4-5-"]]),
+            ],
+        }
+    if resource.module == "shotchartlineupdetail":
+        return {
+            "resultSets": [
+                dataset(
+                    "ShotChartLineupDetail",
+                    ["GAME_ID", "TEAM_ID", "GROUP_ID"],
+                    [[GAME, resource.team_id, resource.group_id]],
+                )
+            ]
+        }
     if resource.root:
         root = {"gameId": GAME, "unknown": {"nested": [1, None, "原始"]}}
         if resource.name in ("play_by_play_v3", "live_play_by_play"):
             root["actions"] = [
-                {"actionNumber": 1, "description": "keep unchanged", "unknown": [3, 4]}
+                {
+                    "actionNumber": 1,
+                    "description": "keep unchanged",
+                    "unknown": [3, 4],
+                    "scoreHome": "100",
+                    "scoreAway": "98",
+                }
             ]
         else:
             root["homeTeam"] = {
                 "players": [{"personId": 1}],
-                "statistics": {"points": 100},
+                "statistics": {"points": 100, "fieldGoalsAttempted": 1},
+                "teamId": 10,
+                "score": 100,
             }
             root["awayTeam"] = {
                 "players": [{"personId": 2}],
-                "statistics": {"points": 98},
+                "statistics": {"points": 98, "fieldGoalsAttempted": 1},
+                "teamId": 20,
+                "score": 98,
             }
+            for side in ("homeTeam", "awayTeam"):
+                root[side]["players"][0]["statistics"] = {
+                    key: 0 for key in KEY_FIELDS.get(resource.name, ())
+                }
             if resource.name == "box_score_matchups_v3":
                 for side in ("homeTeam", "awayTeam"):
                     root[side]["players"][0]["matchups"] = [
@@ -104,7 +155,7 @@ class FakeTransport:
         pass
 
     def fetch(self, resource, game_id, person_id=None):
-        key = resource.name if person_id is None else f"common_player_info:{person_id}"
+        key = resource.key(person_id)
         self.calls.append(key)
         if key == self.interrupt:
             raise KeyboardInterrupt
@@ -142,7 +193,7 @@ def run(tmp_path, transport=None, **kwargs):
 
 
 def test_every_official_endpoint_builds_without_sending_request():
-    assert len(RESOURCES) == len({r.module for r in RESOURCES}) == 13
+    assert len(RESOURCES) == len({r.module for r in RESOURCES}) == 15
     for resource in RESOURCES:
         request = resource.request(GAME)
         assert request.parameters["GameID"] == GAME
@@ -175,19 +226,19 @@ def test_season_and_competition(game_id, season, kind):
 def test_collects_all_raw_json_and_deduplicated_profiles(tmp_path):
     report, transport = run(tmp_path)
     assert report["status"] == "complete"
-    assert report["summary"]["game_resources_succeeded"] == 13
+    assert report["summary"]["game_resources_succeeded"] == len(game_keys())
     assert report["profiles"]["person_ids"] == [1, 2, 3]
-    assert transport.calls == [r.name for r in RESOURCES] + [
+    assert transport.calls == game_keys() + [
         f"common_player_info:{i}" for i in (1, 2, 3)
     ]
     directory = tmp_path / GAME
     files = [p for p in directory.rglob("*") if p.is_file()]
-    assert len(files) == 17
-    assert all(p.suffix == ".json" for p in files)
+    assert len(files) == len(game_keys()) + 5
+    assert all(p.suffix in (".json", ".md") for p in files)
     assert json.loads(
-        (directory / "raw/box_score_traditional_v3.json").read_text()
+        (directory / "raw/stats/box_score_traditional_v3.json").read_text()
     ) == payload(RESOURCES[1])
-    assert json.loads((directory / "profiles/1.json").read_text()) == payload(
+    assert json.loads((directory / "raw/players/1.json").read_text()) == payload(
         PROFILE, person_id=1
     )
     assert "fetched_at" in report["resources"]["common_player_info:1"]
@@ -235,7 +286,7 @@ def test_live_fallback_preserves_missing_stats_and_partial_roster(tmp_path):
         "box_score_traditional_v3",
         "play_by_play_v3",
     }
-    assert (tmp_path / GAME / "raw/live_box_score.json").is_file()
+    assert (tmp_path / GAME / "raw/live/live_box_score.json").is_file()
 
 
 def test_empty_data_is_preserved_and_distinguished_from_failure(tmp_path):
@@ -250,13 +301,14 @@ def test_empty_data_is_preserved_and_distinguished_from_failure(tmp_path):
             overrides={"shot_chart_detail": shots, "game_rotation": rotation}
         ),
     )
-    assert report["status"] == "complete"
+    assert report["status"] == "partial"
+    assert report["summary"]["failed_checks"] == ["shotchart_matches_boxscore_fga"]
     assert set(report["summary"]["empty_resources"]) == {
         "shot_chart_detail",
         "game_rotation",
     }
     assert (
-        json.loads((tmp_path / GAME / "raw/shot_chart_detail.json").read_text())
+        json.loads((tmp_path / GAME / "raw/stats/shot_chart_detail.json").read_text())
         == shots
     )
 
@@ -288,9 +340,9 @@ def test_orphan_rotation_without_game_identity_is_refetched(tmp_path):
 def test_missing_corrupted_and_tampered_files_are_refetched(tmp_path):
     run(tmp_path)
     directory = tmp_path / GAME
-    (directory / "raw/box_score_usage_v3.json").write_text("{broken")
-    (directory / "profiles/2.json").unlink()
-    path = directory / "raw/box_score_scoring_v3.json"
+    (directory / "raw/stats/box_score_usage_v3.json").write_text("{broken")
+    (directory / "raw/players/2.json").unlink()
+    path = directory / "raw/stats/box_score_scoring_v3.json"
     modified = json.loads(path.read_text())
     modified["unknownTopLevel"] = ["manually changed"]
     path.write_text(json.dumps(modified))
@@ -306,7 +358,7 @@ def test_missing_corrupted_and_tampered_files_are_refetched(tmp_path):
 def test_in_progress_and_first_final_run_refresh_all_game_resources(tmp_path):
     run(tmp_path, FakeTransport(status=2))
     report, transport = run(tmp_path, FakeTransport(status=3))
-    assert transport.calls == [r.name for r in RESOURCES]
+    assert transport.calls == game_keys()
     assert report["game_status"] == 3
     _, transport = run(tmp_path)
     assert not transport.calls
@@ -320,7 +372,9 @@ def test_interruption_during_final_refresh_does_not_freeze_live_data(tmp_path):
     assert report["status"] == "complete"
     assert "box_score_usage_v3" in transport.calls
     assert "box_score_summary_v3" not in transport.calls
-    raw = json.loads((tmp_path / GAME / "raw/box_score_usage_v3.json").read_text())
+    raw = json.loads(
+        (tmp_path / GAME / "raw/stats/box_score_usage_v3.json").read_text()
+    )
     assert raw == payload(BY_NAME["box_score_usage_v3"])
 
 
@@ -328,12 +382,12 @@ def test_force_refresh_includes_all_profiles_and_preserves_old_file_on_failure(
     tmp_path,
 ):
     run(tmp_path)
-    path = tmp_path / GAME / "raw/box_score_advanced_v3.json"
+    path = tmp_path / GAME / "raw/stats/box_score_advanced_v3.json"
     before = path.read_bytes()
     report, transport = run(
         tmp_path, FakeTransport(failures=("box_score_advanced_v3",)), force=True
     )
-    assert len(transport.calls) == 16
+    assert len(transport.calls) == len(game_keys()) + 3
     assert report["status"] == "partial"
     assert path.read_bytes() == before
     assert "retained_previous_file" in report["resources"]["box_score_advanced_v3"]
@@ -349,7 +403,7 @@ def test_failed_forced_profile_refresh_is_retried_instead_of_using_old_profile(
         tmp_path, FakeTransport(failures=("common_player_info:2",)), force=True
     )
     assert report["status"] == "partial"
-    assert (tmp_path / GAME / "profiles/2.json").is_file()
+    assert (tmp_path / GAME / "raw/players/2.json").is_file()
     report, transport = run(tmp_path)
     assert transport.calls == ["common_player_info:2"]
     assert report["status"] == "complete"
@@ -372,7 +426,7 @@ def test_invalid_roster_id_does_not_prevent_other_profiles(tmp_path):
 def test_endpoint_parameter_failure_does_not_stop_other_endpoints(
     tmp_path, monkeypatch
 ):
-    from nba_pbp.game.resources import Resource
+    from nba_game.sources.stats import Resource
 
     original = Resource.request
 
@@ -395,7 +449,7 @@ def test_session_setup_failure_still_writes_missing_resource_report(tmp_path):
 
     report, _ = run(tmp_path, FailedSetup())
     assert report["status"] == "partial"
-    assert len(report["summary"]["failed_resources"]) == 13
+    assert len(report["summary"]["failed_resources"]) == len(RESOURCES) + 4
     assert "secret" not in json.dumps(report)
     assert (tmp_path / GAME / "manifest.json").is_file()
 
@@ -423,7 +477,7 @@ def test_wrong_game_or_person_is_not_saved_as_success(tmp_path):
     )
     assert report["resources"]["box_score_advanced_v3"]["status"] == "failed"
     assert report["resources"]["common_player_info:3"]["status"] == "failed"
-    assert not (tmp_path / GAME / "profiles/3.json").exists()
+    assert not (tmp_path / GAME / "raw/players/3.json").exists()
     shots = payload(BY_NAME["shot_chart_detail"])
     shots["resultSets"][0]["rowSet"][0][0] = "0022300002"
     with pytest.raises(ResponseValidationError):
@@ -460,7 +514,7 @@ def test_cli_rejects_invalid_id_before_io(tmp_path, game_id):
 def test_cli_default_timeout_path_and_exit_codes(tmp_path, monkeypatch):
     args = cli.build_parser().parse_args([GAME])
     assert args.timeout == 30
-    assert args.output_dir == Path(__file__).resolve().parents[1] / "data/output"
+    assert args.output_dir == Path(__file__).resolve().parents[1] / "data/games"
 
     class FakeCollector(Collector):
         def __init__(self, *args, **kwargs):
@@ -524,17 +578,19 @@ def test_transport_retries_paces_and_never_runs_dataframe_parser(monkeypatch):
     assert all(b - a >= 1 for a, b in pairwise(starts))
 
 
-@pytest.mark.parametrize("kind", ["403", "html", "429", "timeout", "json"])
+@pytest.mark.parametrize(
+    "kind", ["400", "403", "500", "html", "429", "timeout", "json"]
+)
 def test_transport_error_policy_and_redaction(monkeypatch, kind):
     from nba_api.stats.library.http import NBAStatsHTTP
 
-    from nba_pbp.common.errors import SourceBlockedError
+    from nba_game.errors import SourceBlockedError
 
     clock, calls = FakeClock(), []
 
     def failed(self, **kwargs):
         calls.append(kwargs)
-        if kind in ("403", "429"):
+        if kind in ("400", "403", "429", "500"):
             response = requests.Response()
             response.status_code = int(kind)
             raise requests.HTTPError(
@@ -555,7 +611,7 @@ def test_transport_error_policy_and_redaction(monkeypatch, kind):
     )
     with pytest.raises(RequestFailure) as exc:
         transport.fetch(RESOURCES[0], GAME)
-    assert len(calls) == (1 if kind in ("403", "html") else 2)
+    assert len(calls) == (1 if kind in ("400", "403", "html") else 2)
     assert "password" not in str(exc.value)
 
 
@@ -574,8 +630,8 @@ def test_shared_http_session_is_restored_after_exception():
 def test_html_200_error_is_not_reported_as_proven_ip_block(monkeypatch):
     from curl_cffi import requests as curl_requests
 
-    from nba_pbp.common.errors import SourceBlockedError
-    from nba_pbp.common.http import StatusAwareBrowserSession, classify_error
+    from nba_game.errors import SourceBlockedError
+    from nba_game.transport import StatusAwareBrowserSession, classify_error
 
     class ErrorPage:
         def __init__(self):
@@ -604,12 +660,15 @@ def test_html_200_error_is_not_reported_as_proven_ip_block(monkeypatch):
 def test_html_error_records_safe_http_diagnostics(monkeypatch):
     from curl_cffi import requests as curl_requests
 
-    from nba_pbp.common.errors import SourceBlockedError
-    from nba_pbp.common.http import StatusAwareBrowserSession, classify_error
+    from nba_game.errors import SourceBlockedError
+    from nba_game.transport import StatusAwareBrowserSession, classify_error
 
     class ErrorPage:
         status_code = 200
-        headers = {"content-type": "text/html", "server": "AkamaiNetStorage"}
+        headers: ClassVar[dict] = {
+            "content-type": "text/html",
+            "server": "AkamaiNetStorage",
+        }
         text = "<html>secret reflected URL or proxy credentials</html>"
 
         def raise_for_status(self):
@@ -631,8 +690,8 @@ def test_stats_outage_skips_requests_but_keeps_cdn_and_resets_next_run(monkeypat
     from nba_api.live.nba.library.http import NBALiveHTTP
     from nba_api.stats.library.http import NBAStatsHTTP
 
-    from nba_pbp.common.errors import SourceBlockedError
-    from nba_pbp.game.resources import LIVE_BOX
+    from nba_game.errors import SourceBlockedError
+    from nba_game.sources.live import LIVE_BOX
 
     calls = []
 
@@ -673,7 +732,7 @@ def test_stats_outage_skips_requests_but_keeps_cdn_and_resets_next_run(monkeypat
 def test_single_html_failure_does_not_disable_unrelated_stats_endpoints(monkeypatch):
     from nba_api.stats.library.http import NBAStatsHTTP
 
-    from nba_pbp.common.errors import SourceBlockedError
+    from nba_game.errors import SourceBlockedError
 
     clock, calls = FakeClock(), []
 
@@ -705,13 +764,13 @@ def test_outage_manifest_records_unrequested_resources_honestly(tmp_path, monkey
     from nba_api.live.nba.library.http import NBALiveHTTP
     from nba_api.stats.library.http import NBAStatsHTTP
 
-    from nba_pbp.common.errors import SourceBlockedError
+    from nba_game.errors import SourceBlockedError
 
     def blocked(*args, **kwargs):
         raise SourceBlockedError("HTML")
 
     def live(self, **kwargs):
-        from nba_pbp.game.resources import LIVE_BOX, LIVE_PBP
+        from nba_game.sources.live import LIVE_BOX, LIVE_PBP
 
         resource = LIVE_BOX if kwargs["endpoint"].startswith("boxscore/") else LIVE_PBP
 
@@ -733,13 +792,13 @@ def test_outage_manifest_records_unrequested_resources_honestly(tmp_path, monkey
     ).run()
     entries = report["resources"]
     assert report["status"] == "partial" and report["stats_unavailable"]
-    assert report["summary"]["game_resources_succeeded"] == 0
+    assert report["summary"]["game_resources_succeeded"] == 2
     assert entries["live_box_score"]["status"] == "success"
     assert entries["live_play_by_play"]["status"] == "success"
     assert entries["box_score_summary_v3"]["attempts"] == 1
     assert entries["common_player_info:1"]["skipped"]
     assert entries["common_player_info:1"]["attempts"] == 0
-    assert not (tmp_path / GAME / "profiles/1.json").exists()
+    assert not (tmp_path / GAME / "raw/players/1.json").exists()
     assert not any("正在抓取：common_player_info" in text for text in messages)
     assert sum("两个不同接口" in text for text in messages) == 1
 
@@ -747,7 +806,7 @@ def test_outage_manifest_records_unrequested_resources_honestly(tmp_path, monkey
 def test_network_check_validates_both_sources_without_modifying_archive(
     tmp_path, monkeypatch, capsys
 ):
-    from nba_pbp.game import diagnostics
+    from nba_game import diagnostics
 
     monkeypatch.setattr(diagnostics, "Transport", lambda *a: FakeTransport())
     assert cli.main([GAME, "--output-dir", str(tmp_path), "--check-network"]) == 0
@@ -765,57 +824,229 @@ def test_network_check_validates_both_sources_without_modifying_archive(
     assert "NBA Stats：不可用" in output and "NBA Live CDN：可用" in output
 
 
-def test_legacy_pbp_live_fallback_uses_real_live_dataset_and_saves_all_fields(
-    tmp_path, monkeypatch
-):
-    from nba_api.library.http import NBAResponse
-    from nba_api.live.nba.library.http import NBALiveHTTP
-    from nba_api.stats.library.http import NBAStatsHTTP
+def test_extension_parameters_are_game_scoped_and_omit_nulls():
+    dunk = BY_NAME["dunk_score_leaders"].request("0042400401").parameters
+    assert dunk["GameID"] == "0042400401"
+    assert dunk["Season"] == "2024-25" and dunk["SeasonType"] == "Playoffs"
+    assert dunk["LeagueID"] == "00"
+    assert "PlayerID" not in dunk and "TeamID" not in dunk
+    lineup = LINEUPS.bind(10).request(GAME).parameters
+    assert lineup["TeamID"] == 10 and lineup["GroupQuantity"] == 5
+    assert lineup["MeasureType"] == "Base" and lineup["PerMode"] == "Totals"
+    shots = LINEUP_SHOTS.bind(10, "-1-2-3-4-5-").request(GAME).parameters
+    assert shots["GROUP_ID"] == "-1-2-3-4-5-"
+    assert shots["ContextMeasure"] == "FGA"
+    assert shots["GameID"] == GAME and shots["Season"] == "2023-24"
 
-    from nba_pbp.common.errors import SourceBlockedError
-    from nba_pbp.pbp import cli as pbp_cli
 
-    raw = {
-        "meta": {"version": 1},
-        "game": {
-            "gameId": GAME,
-            "actions": [
-                {
-                    "actionNumber": 2,
-                    "clock": "PT12M00.00S",
-                    "description": "Period Start",
-                    "x": None,
-                    "unknown": {"keep": [1, 2]},
-                },
-                {
-                    "actionNumber": 7,
-                    "clock": "PT11M39.00S",
-                    "description": "original shot description",
-                    "x": 14.4,
-                    "shotDistance": 8.58,
-                },
-            ],
-        },
+def test_empty_dunks_are_legal_and_retried_on_next_run(tmp_path):
+    empty = {"params": {"GameID": GAME}, "dunks": []}
+    report, _ = run(tmp_path, FakeTransport(overrides={"dunk_score_leaders": empty}))
+    assert report["status"] == "complete"
+    assert report["summary"]["empty_resources"] == ["dunk_score_leaders"]
+    second, transport = run(tmp_path)
+    assert transport.calls == ["dunk_score_leaders"]
+    assert second["status"] == "complete"
+
+
+def test_lineup_failure_skips_only_its_dependents(tmp_path):
+    report, transport = run(tmp_path, FakeTransport(failures=("team_dash_lineups:10",)))
+    assert report["resources"]["shot_chart_lineup_detail:10"]["status"] == "skipped"
+    assert report["resources"]["shot_chart_lineup_detail:10"]["attempts"] == 0
+    assert "shot_chart_lineup_detail:20:-1-2-3-4-5-" in transport.calls
+    assert report["summary"]["profiles_succeeded"] == 3
+    assert report["status"] == "partial"
+    report, transport = run(tmp_path)
+    assert transport.calls == [
+        "team_dash_lineups:10",
+        "shot_chart_lineup_detail:10:-1-2-3-4-5-",
+    ]
+    assert report["status"] == "complete"
+
+
+def test_missing_team_ids_record_dependency_and_still_collect_profiles(tmp_path):
+    overrides = {}
+    for resource in (RESOURCES[0], RESOURCES[1], LIVE_BOX):
+        raw = payload(resource)
+        for side in ("homeTeam", "awayTeam"):
+            raw[resource.root][side].pop("teamId")
+        overrides[resource.name] = raw
+    report, transport = run(tmp_path, FakeTransport(overrides=overrides))
+    assert report["resources"]["team_dash_lineups"]["status"] == "skipped"
+    assert report["resources"]["shot_chart_lineup_detail"]["status"] == "skipped"
+    assert report["summary"]["profiles_succeeded"] == 3
+    assert "box_score_defensive_v2" in transport.calls
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["wrong_game", "wrong_team", "wrong_group", "unsafe_group", "multiple_games"],
+)
+def test_lineup_and_dunk_identity_validation(kind):
+    resource = (
+        LINEUPS.bind(10)
+        if kind in ("unsafe_group", "multiple_games")
+        else LINEUP_SHOTS.bind(10, "-1-2-3-4-5-")
+    )
+    raw = payload(resource)
+    if kind == "wrong_game":
+        raw["resultSets"][0]["rowSet"][0][0] = "0022300002"
+    elif kind == "wrong_team":
+        raw["resultSets"][0]["rowSet"][0][1] = 999
+    elif kind == "wrong_group":
+        raw["resultSets"][0]["rowSet"][0][2] = "-1-2-3-4-6-"
+    elif kind == "unsafe_group":
+        raw["resultSets"][1]["rowSet"][0][1] = "../../escape"
+    else:
+        raw["resultSets"][0]["rowSet"][0][1] = 82
+    with pytest.raises(ResponseValidationError):
+        inspect_response(resource, raw, GAME)
+    with pytest.raises(ResponseValidationError):
+        inspect_response(
+            BY_NAME["dunk_score_leaders"], {"dunks": [{"gameId": "0022300002"}]}, GAME
+        )
+
+
+def test_cross_source_score_disagreement_is_partial(tmp_path):
+    live = payload(LIVE_BOX)
+    live["game"]["homeTeam"]["score"] = 99
+    report, _ = run(tmp_path, FakeTransport(overrides={LIVE_BOX.name: live}))
+    assert report["status"] == "partial"
+    assert report["summary"]["failed_resources"] == []
+    assert "score:live_box_score:homeTeam" in report["summary"]["failed_checks"]
+    assert (
+        "score:live_box_score:homeTeam" in (tmp_path / GAME / "summary.md").read_text()
+    )
+
+
+def legacy_archive(tmp_path):
+    from nba_game.storage import file_hash
+
+    legacy = tmp_path / "output" / GAME
+    entries = {}
+    for resource in RESOURCES[:13]:
+        path = legacy / "raw" / f"{resource.name}.json"
+        atomic_json(path, payload(resource))
+        entries[resource.name] = {
+            "status": "success",
+            "sha256": file_hash(path),
+            "parameters": {"GameID": GAME},
+            "game_status_at_fetch": 3,
+            "fetched_at": "2025-01-01T00:00:00+00:00",
+        }
+    path = legacy / "profiles/1.json"
+    atomic_json(path, payload(PROFILE, person_id=1))
+    entries["common_player_info:1"] = {
+        "status": "success",
+        "sha256": file_hash(path),
+        "fetched_at": "2025-01-01T00:00:00+00:00",
     }
-    calls = []
+    atomic_json(
+        legacy / "manifest.json",
+        {"schema_version": 1, "game_id": GAME, "resources": entries},
+    )
+    return legacy
 
-    def stats_unavailable(self, **kwargs):
-        calls.append("stats")
-        raise SourceBlockedError("HTML", status_code=200)
 
-    def live_response(self, **kwargs):
-        calls.append("cdn")
-        return NBAResponse(json.dumps(raw), 200, "https://cdn.nba.com/example.json")
+def test_legacy_copy_preserves_source_provenance_and_reuses_verified_cache(tmp_path):
+    legacy = legacy_archive(tmp_path)
+    before = {
+        str(p.relative_to(legacy)): p.read_bytes() for p in legacy.rglob("*.json")
+    }
+    report, transport = run(tmp_path / "games")
+    assert report["status"] == "complete"
+    assert all(r.name not in transport.calls for r in RESOURCES[:13])
+    assert "common_player_info:1" not in transport.calls
+    assert "box_score_defensive_v2" in transport.calls
+    entry = report["resources"]["box_score_traditional_v3"]
+    assert entry["fetched_at"] == "2025-01-01T00:00:00+00:00"
+    assert entry["migration"]["source_file"].endswith(
+        "raw/box_score_traditional_v3.json"
+    )
+    assert before == {
+        str(p.relative_to(legacy)): p.read_bytes() for p in legacy.rglob("*.json")
+    }
+    assert report["schema_version"] == 2
 
-    monkeypatch.setattr(NBAStatsHTTP, "send_api_request", stats_unavailable)
-    monkeypatch.setattr(NBALiveHTTP, "send_api_request", live_response)
-    assert pbp_cli.main([GAME, "--output-dir", str(tmp_path)]) == 0
-    directory = tmp_path / GAME / "pbp"
-    assert json.loads((directory / "api_response_raw.json").read_text()) == raw
-    rows = json.loads((directory / "play_by_play_raw.json").read_text())
-    assert rows == [{"gameId": GAME, **row} for row in raw["game"]["actions"]]
-    assert (directory / "play_by_play_raw.csv").is_file()
-    assert calls == ["stats", "cdn"]
-    # A subsequent normal run must validate and use these outputs as a cache.
-    assert pbp_cli.main([GAME, "--output-dir", str(tmp_path)]) == 0
-    assert calls == ["stats", "cdn"]
+
+def test_migration_rejects_corrupt_old_files_and_keeps_valid_new_files(tmp_path):
+    legacy = legacy_archive(tmp_path)
+    (legacy / "raw/box_score_usage_v3.json").write_text("{broken")
+    new_raw = payload(RESOURCES[1])
+    new_raw["unknownTopLevel"] = ["newer version"]
+    run(
+        tmp_path / "games",
+        FakeTransport(overrides={RESOURCES[1].name: new_raw}),
+        force=True,
+    )
+    destination = tmp_path / "games" / GAME / RESOURCES[1].relative_path()
+    before = destination.read_bytes()
+    report, _ = run(tmp_path / "games")
+    assert destination.read_bytes() == before
+    assert report["status"] == "complete"
+    destination = tmp_path / "other" / GAME
+    from nba_game.storage import import_legacy
+
+    import_legacy(destination, legacy, GAME)
+    assert not (destination / BY_NAME["box_score_usage_v3"].relative_path()).exists()
+
+
+def test_interruption_report_marks_unexecuted_profiles_and_preserves_progress(tmp_path):
+    with pytest.raises(KeyboardInterrupt):
+        run(tmp_path, FakeTransport(interrupt="common_player_info:2"))
+    report = json.loads((tmp_path / GAME / "manifest.json").read_text())
+    assert report["status"] == "interrupted"
+    assert report["resources"]["common_player_info:1"]["status"] == "success"
+    assert report["resources"]["common_player_info:2"]["status"] == "skipped"
+    assert (tmp_path / GAME / "summary.md").exists()
+    report, transport = run(tmp_path)
+    assert transport.calls == ["common_player_info:2", "common_player_info:3"]
+    assert report["status"] == "complete"
+
+
+def test_missing_required_statistics_is_a_reported_failure(tmp_path):
+    advanced = payload(BY_NAME["box_score_advanced_v3"])
+    advanced["boxScoreAdvanced"]["homeTeam"]["players"][0]["statistics"] = None
+    report, _ = run(
+        tmp_path, FakeTransport(overrides={"box_score_advanced_v3": advanced})
+    )
+    assert report["status"] == "partial"
+    assert report["resources"]["box_score_advanced_v3"]["status"] == "failed"
+    assert report["summary"]["profiles_succeeded"] == 3
+
+
+def test_empty_statistics_fields_are_not_mistaken_for_complete_data(tmp_path):
+    advanced = payload(BY_NAME["box_score_advanced_v3"])
+    advanced["boxScoreAdvanced"]["homeTeam"]["players"][0]["statistics"] = {}
+    report, _ = run(
+        tmp_path, FakeTransport(overrides={"box_score_advanced_v3": advanced})
+    )
+    assert report["resources"]["box_score_advanced_v3"]["status"] == "success"
+    assert report["status"] == "partial"
+    assert report["summary"]["failed_checks"] == ["fields:box_score_advanced_v3"]
+
+
+def test_corrupt_manifest_entries_do_not_break_migration_or_collection(tmp_path):
+    legacy = legacy_archive(tmp_path)
+    manifest = json.loads((legacy / "manifest.json").read_text())
+    manifest["resources"]["box_score_summary_v3"] = None
+    manifest["resources"]["box_score_traditional_v3"]["parameters"] = None
+    atomic_json(legacy / "manifest.json", manifest)
+    report, _ = run(tmp_path / "games")
+    assert report["status"] == "complete"
+
+
+def test_legacy_wrong_game_is_not_imported_even_with_matching_checksum(tmp_path):
+    from nba_game.storage import file_hash, import_legacy
+
+    legacy = legacy_archive(tmp_path)
+    path = legacy / "raw/box_score_advanced_v3.json"
+    raw = json.loads(path.read_text())
+    raw["boxScoreAdvanced"]["gameId"] = "0022300002"
+    atomic_json(path, raw)
+    manifest = json.loads((legacy / "manifest.json").read_text())
+    manifest["resources"]["box_score_advanced_v3"]["sha256"] = file_hash(path)
+    atomic_json(legacy / "manifest.json", manifest)
+    dest = tmp_path / "games" / GAME
+    import_legacy(dest, legacy, GAME)
+    assert not (dest / BY_NAME["box_score_advanced_v3"].relative_path()).exists()

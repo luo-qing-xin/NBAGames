@@ -1,11 +1,11 @@
 """Shared application-specific exceptions."""
 
 
-class NbaPbpError(Exception):
+class NbaGameError(Exception):
     """Base error for expected application failures."""
 
 
-class FetchError(NbaPbpError):
+class FetchError(NbaGameError):
     """Raised when an API request cannot be completed."""
 
 
@@ -20,9 +20,9 @@ class SourceBlockedError(Exception):
         self.akamai = akamai
 
 
-class ResponseValidationError(NbaPbpError):
+class ResponseValidationError(NbaGameError):
     """Raised when an API response is not a complete game response."""
 
 
-class StorageError(NbaPbpError):
+class StorageError(NbaGameError):
     """Raised when output cannot be saved safely."""
