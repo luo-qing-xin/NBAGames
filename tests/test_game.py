@@ -423,6 +423,92 @@ def test_invalid_roster_id_does_not_prevent_other_profiles(tmp_path):
     assert report["status"] == "partial"
 
 
+@pytest.mark.parametrize("side", ["homeTeam", "awayTeam"])
+@pytest.mark.parametrize(
+    ("resource", "field"), [(RESOURCES[0], "inactives"), (RESOURCES[1], "players")]
+)
+def test_missing_roster_field_is_failed_and_retried(tmp_path, resource, field, side):
+    raw = payload(resource)
+    del raw[resource.root][side][field]
+    report, transport = run(
+        tmp_path, FakeTransport(overrides={resource.name: raw})
+    )
+    assert report["status"] == "partial"
+    assert not report["profiles"]["roster_complete"]
+    assert report["resources"][resource.name]["status"] == "failed"
+    assert report["summary"]["profiles_succeeded"] == (2 if resource is RESOURCES[0] else 3)
+    assert "box_score_defensive_v2" in transport.calls
+    assert not (tmp_path / GAME / resource.relative_path()).exists()
+
+    report, transport = run(tmp_path)
+    # Without a summary, the first traditional response predates final-status
+    # confirmation, and inactive player 3 is unknown until the retry.
+    expected = (
+        [RESOURCES[0].name, RESOURCES[1].name, PROFILE.key(3)]
+        if resource is RESOURCES[0]
+        else [resource.name]
+    )
+    assert transport.calls == expected
+    assert report["status"] == "complete"
+
+
+def test_explicit_empty_inactive_lists_are_complete(tmp_path):
+    raw = payload(RESOURCES[0])
+    for side in ("homeTeam", "awayTeam"):
+        raw[RESOURCES[0].root][side]["inactives"] = []
+    report, _ = run(tmp_path, FakeTransport(overrides={RESOURCES[0].name: raw}))
+    assert report["status"] == "complete"
+    assert report["profiles"]["roster_complete"]
+    assert report["profiles"]["person_ids"] == [1, 2]
+
+
+@pytest.mark.parametrize("side", ["homeTeam", "awayTeam"])
+def test_one_sided_traditional_roster_is_incomplete(tmp_path, side):
+    raw = payload(RESOURCES[1])
+    raw[RESOURCES[1].root][side]["players"] = []
+    report, _ = run(tmp_path, FakeTransport(overrides={RESOURCES[1].name: raw}))
+    assert report["status"] == "partial"
+    assert not report["profiles"]["roster_complete"]
+    assert report["profiles"]["person_ids"] == [1, 2, 3]
+    assert report["summary"]["profiles_succeeded"] == 3
+
+
+@pytest.mark.parametrize("side", ["homeTeam", "awayTeam"])
+def test_live_boxscore_requires_explicit_player_lists(side):
+    raw = payload(LIVE_BOX)
+    del raw[LIVE_BOX.root][side]["players"]
+    with pytest.raises(ResponseValidationError):
+        inspect_response(LIVE_BOX, raw, GAME)
+
+
+@pytest.mark.parametrize(
+    "kind", ["duplicate_dataset", "duplicate_header", "non_string_header"]
+)
+def test_ambiguous_result_sets_are_rejected_without_replacing_old_cache(tmp_path, kind):
+    resource = BY_NAME["shot_chart_detail"]
+    run(tmp_path)
+    path = tmp_path / GAME / resource.relative_path()
+    before = path.read_bytes()
+    raw = payload(resource)
+    if kind == "duplicate_dataset":
+        wrong = copy.deepcopy(raw["resultSets"][0])
+        wrong["rowSet"][0][0] = "0022300002"
+        raw["resultSets"].insert(0, wrong)
+    elif kind == "duplicate_header":
+        raw["resultSets"][0]["headers"][1] = "GAME_ID"
+        raw["resultSets"][0]["rowSet"] = [[GAME, "0022300002"]]
+    else:
+        raw["resultSets"][0]["headers"][1] = {"invalid": "header"}
+    with pytest.raises(ResponseValidationError):
+        inspect_response(resource, raw, GAME)
+    report, _ = run(tmp_path, FakeTransport(overrides={resource.name: raw}), force=True)
+    entry = report["resources"][resource.name]
+    assert report["status"] == "partial"
+    assert entry["status"] == "failed"
+    assert entry["retained_previous_file"] == str(resource.relative_path())
+    assert path.read_bytes() == before
+
+
 def test_endpoint_parameter_failure_does_not_stop_other_endpoints(
     tmp_path, monkeypatch
 ):
@@ -758,6 +844,46 @@ def test_single_html_failure_does_not_disable_unrelated_stats_endpoints(monkeypa
         transport.fetch(RESOURCES[2], GAME)
     assert transport.fetch(RESOURCES[3], GAME).raw == {"ok": True}
     assert len(calls) == 5
+
+
+@pytest.mark.parametrize("failure", ["timeout", "http_403", "invalid_json"])
+def test_non_html_stats_error_breaks_html_failure_sequence(monkeypatch, failure):
+    from nba_api.stats.library.http import NBAStatsHTTP
+
+    from nba_game.errors import SourceBlockedError
+
+    calls = []
+
+    class RawResponse:
+        def get_dict(self):
+            return {"ok": True}
+
+    def send(self, **kwargs):
+        endpoint = kwargs["endpoint"]
+        calls.append(endpoint)
+        if endpoint in (RESOURCES[0].module, RESOURCES[2].module):
+            raise SourceBlockedError("HTML")
+        if endpoint == RESOURCES[1].module:
+            if failure == "timeout":
+                raise requests.Timeout("sensitive proxy details")
+            if failure == "http_403":
+                response = requests.Response()
+                response.status_code = 403
+                raise requests.HTTPError(response=response)
+            raise json.JSONDecodeError("invalid JSON", "", 0)
+        return RawResponse()
+
+    monkeypatch.setattr(NBAStatsHTTP, "send_api_request", send)
+    clock = FakeClock()
+    with Transport(sleep=clock.sleep, monotonic=clock.time) as transport:
+        for resource in RESOURCES[:3]:
+            with pytest.raises(RequestFailure) as exc:
+                transport.fetch(resource, GAME)
+            assert not exc.value.skipped
+            assert not transport.stats_paused
+        assert transport.fetch(RESOURCES[3], GAME).raw == {"ok": True}
+    assert calls.count(RESOURCES[1].module) == (1 if failure == "http_403" else 2)
+    assert calls[-1] == RESOURCES[3].module
 
 
 def test_outage_manifest_records_unrequested_resources_honestly(tmp_path, monkeypatch):

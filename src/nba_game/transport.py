@@ -248,6 +248,8 @@ class Transport:
                             "请检查 stats.nba.com 的代理路由、切换代理节点或稍后重试。"
                             f"最近错误：{disposition.reason}"
                         )
+                elif is_stats:
+                    self._stats_html_endpoints.clear()
                 if disposition.retryable and attempt < 2:
                     self.sleep(2 ** (attempt - 1) + self.jitter(0, 0.5))
                     continue
