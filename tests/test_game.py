@@ -236,9 +236,9 @@ def test_collects_all_raw_json_and_deduplicated_profiles(tmp_path):
     assert len(files) == len(game_keys()) + 5
     assert all(p.suffix in (".json", ".md") for p in files)
     assert json.loads(
-        (directory / "raw/stats/box_score_traditional_v3.json").read_text()
+        (directory / "raw/stats/box_score_traditional_v3.json").read_text(encoding="utf-8")
     ) == payload(RESOURCES[1])
-    assert json.loads((directory / "raw/players/1.json").read_text()) == payload(
+    assert json.loads((directory / "raw/players/1.json").read_text(encoding="utf-8")) == payload(
         PROFILE, person_id=1
     )
     assert "fetched_at" in report["resources"]["common_player_info:1"]
@@ -308,7 +308,7 @@ def test_empty_data_is_preserved_and_distinguished_from_failure(tmp_path):
         "game_rotation",
     }
     assert (
-        json.loads((tmp_path / GAME / "raw/stats/shot_chart_detail.json").read_text())
+        json.loads((tmp_path / GAME / "raw/stats/shot_chart_detail.json").read_text(encoding="utf-8"))
         == shots
     )
 
@@ -340,12 +340,12 @@ def test_orphan_rotation_without_game_identity_is_refetched(tmp_path):
 def test_missing_corrupted_and_tampered_files_are_refetched(tmp_path):
     run(tmp_path)
     directory = tmp_path / GAME
-    (directory / "raw/stats/box_score_usage_v3.json").write_text("{broken")
+    (directory / "raw/stats/box_score_usage_v3.json").write_text("{broken", encoding="utf-8")
     (directory / "raw/players/2.json").unlink()
     path = directory / "raw/stats/box_score_scoring_v3.json"
-    modified = json.loads(path.read_text())
+    modified = json.loads(path.read_text(encoding="utf-8"))
     modified["unknownTopLevel"] = ["manually changed"]
-    path.write_text(json.dumps(modified))
+    path.write_text(json.dumps(modified), encoding="utf-8")
     report, transport = run(tmp_path)
     assert transport.calls == [
         "box_score_scoring_v3",
@@ -373,7 +373,7 @@ def test_interruption_during_final_refresh_does_not_freeze_live_data(tmp_path):
     assert "box_score_usage_v3" in transport.calls
     assert "box_score_summary_v3" not in transport.calls
     raw = json.loads(
-        (tmp_path / GAME / "raw/stats/box_score_usage_v3.json").read_text()
+        (tmp_path / GAME / "raw/stats/box_score_usage_v3.json").read_text(encoding="utf-8")
     )
     assert raw == payload(BY_NAME["box_score_usage_v3"])
 
@@ -1041,7 +1041,7 @@ def test_cross_source_score_disagreement_is_partial(tmp_path):
     assert report["summary"]["failed_resources"] == []
     assert "score:live_box_score:homeTeam" in report["summary"]["failed_checks"]
     assert (
-        "score:live_box_score:homeTeam" in (tmp_path / GAME / "summary.md").read_text()
+        "score:live_box_score:homeTeam" in (tmp_path / GAME / "summary.md").read_text(encoding="utf-8")
     )
 
 
@@ -1086,9 +1086,9 @@ def test_legacy_copy_preserves_source_provenance_and_reuses_verified_cache(tmp_p
     assert "box_score_defensive_v2" in transport.calls
     entry = report["resources"]["box_score_traditional_v3"]
     assert entry["fetched_at"] == "2025-01-01T00:00:00+00:00"
-    assert entry["migration"]["source_file"].endswith(
-        "raw/box_score_traditional_v3.json"
-    )
+    assert Path(entry["migration"]["source_file"]) == (
+        legacy / "raw/box_score_traditional_v3.json"
+    ).resolve()
     assert before == {
         str(p.relative_to(legacy)): p.read_bytes() for p in legacy.rglob("*.json")
     }
@@ -1097,7 +1097,7 @@ def test_legacy_copy_preserves_source_provenance_and_reuses_verified_cache(tmp_p
 
 def test_migration_rejects_corrupt_old_files_and_keeps_valid_new_files(tmp_path):
     legacy = legacy_archive(tmp_path)
-    (legacy / "raw/box_score_usage_v3.json").write_text("{broken")
+    (legacy / "raw/box_score_usage_v3.json").write_text("{broken", encoding="utf-8")
     new_raw = payload(RESOURCES[1])
     new_raw["unknownTopLevel"] = ["newer version"]
     run(
@@ -1120,7 +1120,7 @@ def test_migration_rejects_corrupt_old_files_and_keeps_valid_new_files(tmp_path)
 def test_interruption_report_marks_unexecuted_profiles_and_preserves_progress(tmp_path):
     with pytest.raises(KeyboardInterrupt):
         run(tmp_path, FakeTransport(interrupt="common_player_info:2"))
-    report = json.loads((tmp_path / GAME / "manifest.json").read_text())
+    report = json.loads((tmp_path / GAME / "manifest.json").read_text(encoding="utf-8"))
     assert report["status"] == "interrupted"
     assert report["resources"]["common_player_info:1"]["status"] == "success"
     assert report["resources"]["common_player_info:2"]["status"] == "skipped"
@@ -1154,7 +1154,7 @@ def test_empty_statistics_fields_are_not_mistaken_for_complete_data(tmp_path):
 
 def test_corrupt_manifest_entries_do_not_break_migration_or_collection(tmp_path):
     legacy = legacy_archive(tmp_path)
-    manifest = json.loads((legacy / "manifest.json").read_text())
+    manifest = json.loads((legacy / "manifest.json").read_text(encoding="utf-8"))
     manifest["resources"]["box_score_summary_v3"] = None
     manifest["resources"]["box_score_traditional_v3"]["parameters"] = None
     atomic_json(legacy / "manifest.json", manifest)
@@ -1167,10 +1167,10 @@ def test_legacy_wrong_game_is_not_imported_even_with_matching_checksum(tmp_path)
 
     legacy = legacy_archive(tmp_path)
     path = legacy / "raw/box_score_advanced_v3.json"
-    raw = json.loads(path.read_text())
+    raw = json.loads(path.read_text(encoding="utf-8"))
     raw["boxScoreAdvanced"]["gameId"] = "0022300002"
     atomic_json(path, raw)
-    manifest = json.loads((legacy / "manifest.json").read_text())
+    manifest = json.loads((legacy / "manifest.json").read_text(encoding="utf-8"))
     manifest["resources"]["box_score_advanced_v3"]["sha256"] = file_hash(path)
     atomic_json(legacy / "manifest.json", manifest)
     dest = tmp_path / "games" / GAME
