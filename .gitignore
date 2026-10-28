@@ -28,3 +28,6 @@ build/
 
 # Downloaded datasets and generated outputs
 /data/
+
+# Locally ignored tests
+/tests/

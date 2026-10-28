@@ -599,3 +599,223 @@ def test_html_200_error_is_not_reported_as_proven_ip_block(monkeypatch):
     assert "拦截了当前网络出口" not in disposition.reason
     assert disposition.fallback_allowed
     assert not disposition.retryable
+
+
+def test_html_error_records_safe_http_diagnostics(monkeypatch):
+    from curl_cffi import requests as curl_requests
+
+    from nba_pbp.common.errors import SourceBlockedError
+    from nba_pbp.common.http import StatusAwareBrowserSession, classify_error
+
+    class ErrorPage:
+        status_code = 200
+        headers = {"content-type": "text/html", "server": "AkamaiNetStorage"}
+        text = "<html>secret reflected URL or proxy credentials</html>"
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(curl_requests.Session, "get", lambda *a, **kw: ErrorPage())
+    session = StatusAwareBrowserSession()
+    try:
+        with pytest.raises(SourceBlockedError) as exc:
+            session.get("https://stats.nba.com/stats/commonplayerinfo")
+    finally:
+        session.close()
+    reason = classify_error(exc.value).reason
+    assert "HTTP 200" in reason and "AkamaiNetStorage" in reason
+    assert "secret" not in reason and "credentials" not in reason
+
+
+def test_stats_outage_skips_requests_but_keeps_cdn_and_resets_next_run(monkeypatch):
+    from nba_api.live.nba.library.http import NBALiveHTTP
+    from nba_api.stats.library.http import NBAStatsHTTP
+
+    from nba_pbp.common.errors import SourceBlockedError
+    from nba_pbp.game.resources import LIVE_BOX
+
+    calls = []
+
+    def blocked(self, **kwargs):
+        calls.append(kwargs["endpoint"])
+        raise SourceBlockedError("HTML", status_code=200, akamai=True)
+
+    class LiveResponse:
+        def get_dict(self):
+            return payload(LIVE_BOX)
+
+    monkeypatch.setattr(NBAStatsHTTP, "send_api_request", blocked)
+    monkeypatch.setattr(
+        NBALiveHTTP, "send_api_request", lambda *a, **kw: LiveResponse()
+    )
+    clock = FakeClock()
+    transport = Transport(sleep=clock.sleep, monotonic=clock.time)
+    with transport:
+        for resource in RESOURCES[:2]:
+            with pytest.raises(RequestFailure) as exc:
+                transport.fetch(resource, GAME)
+            assert exc.value.attempts == 1 and not exc.value.skipped
+        for resource, person_id in ((RESOURCES[2], None), (PROFILE, 123)):
+            with pytest.raises(RequestFailure) as exc:
+                transport.fetch(resource, GAME, person_id)
+            assert exc.value.attempts == 0 and exc.value.skipped
+            assert "两个不同接口" in str(exc.value)
+        assert transport.fetch(LIVE_BOX, GAME).raw == payload(LIVE_BOX)
+    assert calls == [r.module for r in RESOURCES[:2]]
+    # The next run must test the route again after a node change or recovery.
+    with transport:
+        with pytest.raises(RequestFailure) as exc:
+            transport.fetch(RESOURCES[0], GAME)
+        assert exc.value.attempts == 1 and not exc.value.skipped
+    assert len(calls) == 3
+
+
+def test_single_html_failure_does_not_disable_unrelated_stats_endpoints(monkeypatch):
+    from nba_api.stats.library.http import NBAStatsHTTP
+
+    from nba_pbp.common.errors import SourceBlockedError
+
+    clock, calls = FakeClock(), []
+
+    class RawResponse:
+        def get_dict(self):
+            return {"ok": True}
+
+    def send(self, **kwargs):
+        calls.append(kwargs["endpoint"])
+        if len(calls) in (1, 2, 4):
+            raise SourceBlockedError("HTML")
+        return RawResponse()
+
+    monkeypatch.setattr(NBAStatsHTTP, "send_api_request", send)
+    transport = Transport(sleep=clock.sleep, monotonic=clock.time)
+    # Two failures of the same endpoint don't establish a source-wide outage.
+    for _ in range(2):
+        with pytest.raises(RequestFailure):
+            transport.fetch(RESOURCES[0], GAME)
+    assert transport.fetch(RESOURCES[1], GAME).raw == {"ok": True}
+    # A success resets the failure sequence.
+    with pytest.raises(RequestFailure):
+        transport.fetch(RESOURCES[2], GAME)
+    assert transport.fetch(RESOURCES[3], GAME).raw == {"ok": True}
+    assert len(calls) == 5
+
+
+def test_outage_manifest_records_unrequested_resources_honestly(tmp_path, monkeypatch):
+    from nba_api.live.nba.library.http import NBALiveHTTP
+    from nba_api.stats.library.http import NBAStatsHTTP
+
+    from nba_pbp.common.errors import SourceBlockedError
+
+    def blocked(*args, **kwargs):
+        raise SourceBlockedError("HTML")
+
+    def live(self, **kwargs):
+        from nba_pbp.game.resources import LIVE_BOX, LIVE_PBP
+
+        resource = LIVE_BOX if kwargs["endpoint"].startswith("boxscore/") else LIVE_PBP
+
+        class RawResponse:
+            def get_dict(self):
+                return payload(resource)
+
+        return RawResponse()
+
+    monkeypatch.setattr(NBAStatsHTTP, "send_api_request", blocked)
+    monkeypatch.setattr(NBALiveHTTP, "send_api_request", live)
+    clock = FakeClock()
+    messages = []
+    report = Collector(
+        GAME,
+        tmp_path,
+        transport=Transport(sleep=clock.sleep, monotonic=clock.time),
+        progress=messages.append,
+    ).run()
+    entries = report["resources"]
+    assert report["status"] == "partial" and report["stats_unavailable"]
+    assert report["summary"]["game_resources_succeeded"] == 0
+    assert entries["live_box_score"]["status"] == "success"
+    assert entries["live_play_by_play"]["status"] == "success"
+    assert entries["box_score_summary_v3"]["attempts"] == 1
+    assert entries["common_player_info:1"]["skipped"]
+    assert entries["common_player_info:1"]["attempts"] == 0
+    assert not (tmp_path / GAME / "profiles/1.json").exists()
+    assert not any("正在抓取：common_player_info" in text for text in messages)
+    assert sum("两个不同接口" in text for text in messages) == 1
+
+
+def test_network_check_validates_both_sources_without_modifying_archive(
+    tmp_path, monkeypatch, capsys
+):
+    from nba_pbp.game import diagnostics
+
+    monkeypatch.setattr(diagnostics, "Transport", lambda *a: FakeTransport())
+    assert cli.main([GAME, "--output-dir", str(tmp_path), "--check-network"]) == 0
+    assert not list(tmp_path.iterdir())
+    output = capsys.readouterr().out
+    assert "NBA Stats：可用" in output and "NBA Live CDN：可用" in output
+    monkeypatch.setattr(
+        diagnostics,
+        "Transport",
+        lambda *a: FakeTransport(failures=("box_score_summary_v3",)),
+    )
+    assert cli.main([GAME, "--output-dir", str(tmp_path), "--check-network"]) == 1
+    assert not list(tmp_path.iterdir())
+    output = capsys.readouterr().out
+    assert "NBA Stats：不可用" in output and "NBA Live CDN：可用" in output
+
+
+def test_legacy_pbp_live_fallback_uses_real_live_dataset_and_saves_all_fields(
+    tmp_path, monkeypatch
+):
+    from nba_api.library.http import NBAResponse
+    from nba_api.live.nba.library.http import NBALiveHTTP
+    from nba_api.stats.library.http import NBAStatsHTTP
+
+    from nba_pbp.common.errors import SourceBlockedError
+    from nba_pbp.pbp import cli as pbp_cli
+
+    raw = {
+        "meta": {"version": 1},
+        "game": {
+            "gameId": GAME,
+            "actions": [
+                {
+                    "actionNumber": 2,
+                    "clock": "PT12M00.00S",
+                    "description": "Period Start",
+                    "x": None,
+                    "unknown": {"keep": [1, 2]},
+                },
+                {
+                    "actionNumber": 7,
+                    "clock": "PT11M39.00S",
+                    "description": "original shot description",
+                    "x": 14.4,
+                    "shotDistance": 8.58,
+                },
+            ],
+        },
+    }
+    calls = []
+
+    def stats_unavailable(self, **kwargs):
+        calls.append("stats")
+        raise SourceBlockedError("HTML", status_code=200)
+
+    def live_response(self, **kwargs):
+        calls.append("cdn")
+        return NBAResponse(json.dumps(raw), 200, "https://cdn.nba.com/example.json")
+
+    monkeypatch.setattr(NBAStatsHTTP, "send_api_request", stats_unavailable)
+    monkeypatch.setattr(NBALiveHTTP, "send_api_request", live_response)
+    assert pbp_cli.main([GAME, "--output-dir", str(tmp_path)]) == 0
+    directory = tmp_path / GAME / "pbp"
+    assert json.loads((directory / "api_response_raw.json").read_text()) == raw
+    rows = json.loads((directory / "play_by_play_raw.json").read_text())
+    assert rows == [{"gameId": GAME, **row} for row in raw["game"]["actions"]]
+    assert (directory / "play_by_play_raw.csv").is_file()
+    assert calls == ["stats", "cdn"]
+    # A subsequent normal run must validate and use these outputs as a cache.
+    assert pbp_cli.main([GAME, "--output-dir", str(tmp_path)]) == 0
+    assert calls == ["stats", "cdn"]
