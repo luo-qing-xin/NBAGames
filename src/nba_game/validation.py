@@ -20,6 +20,12 @@ def result_sets(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
         headers, rows = dataset.get("headers"), dataset.get("rowSet")
         if not isinstance(headers, list) or not isinstance(rows, list):
             raise ResponseValidationError("结果集缺少 headers/rowSet")
+        if not all(isinstance(header, str) for header in headers):
+            raise ResponseValidationError("结果集字段名必须是字符串")
+        if len(headers) != len(set(headers)):
+            raise ResponseValidationError("结果集存在重复字段名")
+        if dataset["name"] in result:
+            raise ResponseValidationError("响应存在重复结果集名称")
         if not all(isinstance(row, list) and len(row) == len(headers) for row in rows):
             raise ResponseValidationError("结果集字段与记录长度不一致")
         result[dataset["name"]] = dataset
@@ -72,7 +78,11 @@ def inspect_response(
             team = root.get(side)
             if not isinstance(team, dict):
                 raise ResponseValidationError(f"响应缺少 {side}")
-            players = team.get("players", [])
+            players = (
+                team.get("players")
+                if resource.name in ("box_score_traditional_v3", "live_box_score")
+                else team.get("players", [])
+            )
             if not isinstance(players, list) or not all(
                 isinstance(p, dict) for p in players
             ):
@@ -98,7 +108,7 @@ def inspect_response(
             if stats and resource.name != "box_score_matchups_v3":
                 total += 1
             if resource.name == "box_score_summary_v3":
-                inactives = team.get("inactives", [])
+                inactives = team.get("inactives")
                 if not isinstance(inactives, list) or not all(
                     isinstance(p, dict) for p in inactives
                 ):
@@ -309,7 +319,7 @@ def roster_ids(
     traditional: dict | None, summary: dict | None, live: dict | None
 ) -> tuple[list[int], bool]:
     ids: set[int] = set()
-    traditional_ids: set[int] = set()
+    traditional_ids: dict[str, set[int]] = {"homeTeam": set(), "awayTeam": set()}
     valid_ids = True
     for raw, root_key, field in (
         (traditional, "boxScoreTraditional", "players"),
@@ -325,8 +335,8 @@ def roster_ids(
                 if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                     ids.add(value)
                     if raw is traditional:
-                        traditional_ids.add(value)
+                        traditional_ids[side].add(value)
                 else:
                     valid_ids = False
-    complete = bool(traditional_ids) and summary is not None and valid_ids
+    complete = all(traditional_ids.values()) and summary is not None and valid_ids
     return sorted(ids), complete
