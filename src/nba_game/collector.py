@@ -13,11 +13,19 @@ from nba_game.models import GameContext, Resource
 from nba_game.reporting import write_summary
 from nba_game.sources.live import LIVE_BOX, LIVE_PBP
 from nba_game.sources.live import RESOURCES as LIVE_RESOURCES
-from nba_game.sources.stats import BY_NAME, LINEUP_SHOTS, LINEUPS, PROFILE, RESOURCES
+from nba_game.sources.stats import (
+    BY_NAME,
+    LINEUP_SHOTS,
+    LINEUPS,
+    PROFILE,
+    RESOURCES,
+    build_profile_request,
+)
 from nba_game.storage import (
     atomic_json,
     file_hash,
     file_time,
+    has_game_provenance,
     import_legacy,
     load_cache,
     load_manifest,
@@ -125,12 +133,8 @@ class Collector:
         # Reconstruct lost manifests using a final-summary time as a freshness barrier.
         return self.anchor_time is not None and file_time(path) >= self.anchor_time
 
-    def collect(self, resource: Resource, person_id: int | None = None) -> dict | None:
-        key = resource.key(person_id)
-        path = self.path(resource, person_id)
-        previous = self.old_entries.get(key, {})
-        if not isinstance(previous, dict):
-            previous = {}
+    def _resource_entry(self, resource: Resource) -> dict[str, Any]:
+        """Create the manifest metadata shared by cache hits and fresh responses."""
         source = resource.source
         endpoint = (
             f"https://cdn.nba.com/static/json/liveData/"
@@ -138,11 +142,10 @@ class Collector:
             if source == "nba_live_cdn"
             else f"https://stats.nba.com/stats/{resource.module}"
         )
-        parameters: dict[str, Any] = {}
-        entry: dict[str, Any] = {
+        return {
             "endpoint": endpoint,
             "source": source,
-            "parameters": parameters,
+            "parameters": {},
             "resource": resource.name,
             "team_id": resource.team_id,
             "group_id": resource.group_id,
@@ -150,36 +153,61 @@ class Collector:
             "cache_hit": False,
             "attempts": 0,
         }
+
+    def _reusable_cache(
+        self, resource: Resource, path: Path, person_id: int | None, previous: dict
+    ) -> tuple[dict, int] | None:
+        if not self._can_reuse(resource.key(person_id), path, person_id):
+            return None
+        cached = load_cache(
+            path,
+            resource,
+            self.game_id,
+            person_id,
+            trusted_game_id=has_game_provenance(previous, self.game_id),
+        )
+        # Empty responses remain on disk but must be retried on the next run.
+        return None if cached is not None and cached[1] == 0 else cached
+
+    def _record_failure(self, key: str, path: Path, entry: dict, exc: Exception) -> None:
+        reason = (
+            str(exc) if isinstance(exc, NbaGameError) else classify_error(exc).reason
+        )
+        entry.update(
+            status="failed",
+            error=reason,
+            attempts=getattr(exc, "attempts", entry["attempts"]),
+        )
+        if hasattr(exc, "parameters"):
+            entry["parameters"] = exc.parameters
+        if path.is_file():
+            entry["retained_previous_file"] = str(path.relative_to(self.directory))
+        if getattr(exc, "skipped", False):
+            entry["status"] = "skipped"
+            entry["skipped"] = True
+            if "stats_unavailable" not in self.report:
+                self.report["stats_unavailable"] = reason
+                self.progress(reason)
+        else:
+            self.progress(f"未完成：{key}（{reason}）")
+
+    def collect(self, resource: Resource, person_id: int | None = None) -> dict | None:
+        key = resource.key(person_id)
+        path = self.path(resource, person_id)
+        previous = self.old_entries.get(key, {})
+        if not isinstance(previous, dict):
+            previous = {}
+        source = resource.source
+        entry = self._resource_entry(resource)
+        parameters: dict[str, Any] = {}
         raw = None
         try:
             if person_id is not None:
-                from nba_api.stats.endpoints.commonplayerinfo import CommonPlayerInfo
-
-                parameters = CommonPlayerInfo(
-                    player_id=person_id, get_request=False
-                ).parameters
+                parameters = build_profile_request(person_id).parameters
             elif source == "nba_stats":
                 parameters = resource.request(self.game_id).parameters
             entry["parameters"] = parameters
-            previous_parameters = previous.get("parameters", {})
-            trusted_game_id = (
-                bool(previous.get("sha256"))
-                and isinstance(previous_parameters, dict)
-                and previous_parameters.get("GameID") == self.game_id
-            )
-            cached = (
-                load_cache(
-                    path,
-                    resource,
-                    self.game_id,
-                    person_id,
-                    trusted_game_id=trusted_game_id,
-                )
-                if self._can_reuse(key, path, person_id)
-                else None
-            )
-            if cached is not None and cached[1] == 0:
-                cached = None
+            cached = self._reusable_cache(resource, path, person_id, previous)
             if cached is not None:
                 raw, count = cached
                 entry.update(
@@ -216,28 +244,7 @@ class Collector:
             if person_id is None:
                 self.payloads[key] = raw
         except Exception as exc:  # noqa: BLE001 - isolate third-party endpoint failures
-            reason = (
-                str(exc)
-                if isinstance(exc, NbaGameError)
-                else classify_error(exc).reason
-            )
-            entry.update(
-                status="failed",
-                error=reason,
-                attempts=getattr(exc, "attempts", entry["attempts"]),
-            )
-            if hasattr(exc, "parameters"):
-                entry["parameters"] = exc.parameters
-            if path.is_file():
-                entry["retained_previous_file"] = str(path.relative_to(self.directory))
-            if getattr(exc, "skipped", False):
-                entry["status"] = "skipped"
-                entry["skipped"] = True
-                if "stats_unavailable" not in self.report:
-                    self.report["stats_unavailable"] = reason
-                    self.progress(reason)
-            else:
-                self.progress(f"未完成：{key}（{reason}）")
+            self._record_failure(key, path, entry, exc)
             raw = None
         self.report["resources"][key] = entry
         self.checkpoint()
@@ -276,7 +283,7 @@ class Collector:
             for group_id in groups:
                 self.collect(LINEUP_SHOTS.bind(team_id, group_id))
 
-    def finish(self, status: str | None = None) -> dict:
+    def _mark_unexecuted_resources(self) -> None:
         entries = self.report["resources"]
         for resource in (*RESOURCES, *LIVE_RESOURCES):
             if resource.key() not in entries:
@@ -296,14 +303,14 @@ class Collector:
                     "error": "未执行：运行中断",
                 },
             )
+
+    def _summarize_resources(self) -> dict[str, Any]:
+        entries = self.report["resources"]
         game_entries = {
             k: e for k, e in entries.items() if e.get("resource") != PROFILE.name
         }
         failed = [k for k, e in entries.items() if e["status"] in ("failed", "skipped")]
-        self.report["checks"] = consistency_checks(
-            self.payloads, self.current_status == 3
-        )
-        self.report["summary"] = {
+        return {
             "game_resources_expected": len(game_entries),
             "game_resources_succeeded": sum(
                 e["status"] == "success" for e in game_entries.values()
@@ -324,9 +331,16 @@ class Collector:
                 c["name"] for c in self.report["checks"] if c["status"] == "failed"
             ],
         }
+
+    def finish(self, status: str | None = None) -> dict:
+        self._mark_unexecuted_resources()
+        self.report["checks"] = consistency_checks(
+            self.payloads, self.current_status == 3
+        )
+        self.report["summary"] = self._summarize_resources()
         self.report["status"] = status or (
             "complete"
-            if not failed
+            if not self.report["summary"]["failed_resources"]
             and self.report["profiles"]["roster_complete"]
             and not self.report["summary"]["failed_checks"]
             and "run_error" not in self.report

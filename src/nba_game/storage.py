@@ -54,6 +54,16 @@ def file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def has_game_provenance(entry: dict, game_id: str) -> bool:
+    """Check manifest provenance; callers must verify the file checksum separately."""
+    parameters = entry.get("parameters")
+    return (
+        bool(entry.get("sha256"))
+        and isinstance(parameters, dict)
+        and parameters.get("GameID") == game_id
+    )
+
+
 def load_manifest(directory: Path, game_id: str) -> dict:
     try:
         value = load_strict_json(directory / "manifest.json")
@@ -138,11 +148,7 @@ def import_legacy(directory: Path, legacy: Path, game_id: str) -> None:
             entry.get("sha256") and entry["sha256"] != file_hash(source)
         ):
             continue
-        trusted = (
-            bool(entry.get("sha256"))
-            and isinstance(entry.get("parameters"), dict)
-            and entry.get("parameters", {}).get("GameID") == game_id
-        )
+        trusted = has_game_provenance(entry, game_id)
         cached = load_cache(source, resource, game_id, pid, trusted_game_id=trusted)
         if cached is None:
             continue
@@ -159,9 +165,7 @@ def import_legacy(directory: Path, legacy: Path, game_id: str) -> None:
                 resource,
                 game_id,
                 pid,
-                trusted_game_id=bool(existing.get("sha256"))
-                and isinstance(existing.get("parameters"), dict)
-                and existing.get("parameters", {}).get("GameID") == game_id,
+                trusted_game_id=has_game_provenance(existing, game_id),
             )
         ):
             continue

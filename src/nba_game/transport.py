@@ -16,6 +16,7 @@ from curl_cffi.requests import exceptions as curl_exceptions
 
 from nba_game.errors import FetchError, SourceBlockedError
 from nba_game.models import Resource, Response
+from nba_game.sources.stats import build_profile_request
 
 
 @dataclass(frozen=True)
@@ -195,6 +196,25 @@ class Transport:
     def __exit__(self, *args):
         return self._context.__exit__(*args)
 
+    def _pace_request(self) -> None:
+        if self._last_request is not None:
+            self.sleep(max(0, 1.0 - (self.monotonic() - self._last_request)))
+        self._last_request = self.monotonic()
+
+    def _record_stats_failure(self, endpoint: str, exc: Exception, reason: str) -> None:
+        """Pause Stats only after consecutive HTML failures on distinct endpoints."""
+        if not isinstance(exc, SourceBlockedError):
+            self._stats_html_endpoints.clear()
+            return
+        self._stats_html_endpoints.add(endpoint)
+        if len(self._stats_html_endpoints) >= 2:
+            self._stats_unavailable_reason = (
+                "Stats 的两个不同接口连续返回 HTML，本次暂停后续 Stats 请求"
+                "（含球员档案）；已保留缓存并继续处理官方 CDN 数据。"
+                "请检查 stats.nba.com 的代理路由、切换代理节点或稍后重试。"
+                f"最近错误：{reason}"
+            )
+
     def fetch(
         self, resource: Resource, game_id: str, person_id: int | None = None
     ) -> Response:
@@ -209,9 +229,7 @@ class Transport:
             http = NBALiveHTTP()
         else:
             if person_id is not None:
-                from nba_api.stats.endpoints.commonplayerinfo import CommonPlayerInfo
-
-                request = CommonPlayerInfo(player_id=person_id, get_request=False)
+                request = build_profile_request(person_id)
             else:
                 request = resource.request(game_id)
             endpoint, parameters = request.endpoint, request.parameters
@@ -221,9 +239,7 @@ class Transport:
                 self._stats_unavailable_reason, 0, parameters, skipped=True
             )
         for attempt in (1, 2):
-            if self._last_request is not None:
-                self.sleep(max(0, 1.0 - (self.monotonic() - self._last_request)))
-            self._last_request = self.monotonic()
+            self._pace_request()
             try:
                 response = http.send_api_request(
                     endpoint=endpoint,
@@ -239,17 +255,8 @@ class Transport:
                 return Response(raw, parameters, attempt)
             except Exception as exc:  # noqa: BLE001 - classify HTTP client exceptions
                 disposition = classify_error(exc)
-                if is_stats and isinstance(exc, SourceBlockedError):
-                    self._stats_html_endpoints.add(endpoint)
-                    if len(self._stats_html_endpoints) >= 2:
-                        self._stats_unavailable_reason = (
-                            "Stats 的两个不同接口连续返回 HTML，本次暂停后续 Stats 请求"
-                            "（含球员档案）；已保留缓存并继续处理官方 CDN 数据。"
-                            "请检查 stats.nba.com 的代理路由、切换代理节点或稍后重试。"
-                            f"最近错误：{disposition.reason}"
-                        )
-                elif is_stats:
-                    self._stats_html_endpoints.clear()
+                if is_stats:
+                    self._record_stats_failure(endpoint, exc, disposition.reason)
                 if disposition.retryable and attempt < 2:
                     self.sleep(2 ** (attempt - 1) + self.jitter(0, 0.5))
                     continue
