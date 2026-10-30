@@ -27,6 +27,13 @@ from nba_game.transport import RequestFailure, Response, Transport
 from nba_game.validation import KEY_FIELDS, inspect_response
 
 GAME = "0022300001"
+PROVENANCE_CASES = [
+    ({"GameID": GAME}, True, True),
+    ({"GameID": "0022300002"}, True, False),
+    ({"GameID": GAME}, False, False),
+    (None, True, False),
+    ([], True, False),
+]
 
 
 def game_keys():
@@ -1176,3 +1183,258 @@ def test_legacy_wrong_game_is_not_imported_even_with_matching_checksum(tmp_path)
     dest = tmp_path / "games" / GAME
     import_legacy(dest, legacy, GAME)
     assert not (dest / BY_NAME["box_score_advanced_v3"].relative_path()).exists()
+
+
+@pytest.mark.parametrize(
+    ("resource", "person_id", "count"),
+    [
+        (BY_NAME[name], None, count)
+        for name, count in (
+            ("box_score_summary_v3", 1),
+            ("box_score_traditional_v3", 4),
+            ("play_by_play_v3", 1),
+            ("box_score_advanced_v3", 4),
+            ("box_score_four_factors_v3", 4),
+            ("box_score_misc_v3", 4),
+            ("box_score_scoring_v3", 4),
+            ("box_score_usage_v3", 4),
+            ("shot_chart_detail", 2),
+            ("game_rotation", 2),
+            ("box_score_player_track_v3", 4),
+            ("box_score_hustle_v2", 4),
+            ("box_score_matchups_v3", 2),
+            ("box_score_defensive_v2", 4),
+            ("dunk_score_leaders", 1),
+        )
+    ]
+    + [
+        (LIVE_BOX, None, 4),
+        (LIVE_PBP, None, 1),
+        (LINEUPS.bind(10), None, 1),
+        (LINEUP_SHOTS.bind(10, "-1-2-3-4-5-"), None, 1),
+        (PROFILE, 3, 1),
+    ],
+    ids=lambda value: value.name if hasattr(value, "name") else str(value),
+)
+def test_response_row_counts_preserve_raw_payload(resource, person_id, count):
+    raw = payload(resource, person_id=person_id)
+    before = copy.deepcopy(raw)
+    assert inspect_response(resource, raw, GAME, person_id) == count
+    assert raw == before
+
+
+@pytest.mark.parametrize("invalid", [None, {}, [None]])
+@pytest.mark.parametrize(
+    ("resource", "path", "message"),
+    [
+        (LIVE_PBP, ("actions",), "逐回合 actions 不是对象列表"),
+        (LIVE_BOX, ("homeTeam", "players"), "球队 players 不是对象列表"),
+        (RESOURCES[0], ("awayTeam", "inactives"), "未激活名单不是对象列表"),
+        (
+            BY_NAME["box_score_matchups_v3"],
+            ("homeTeam", "players", 0, "matchups"),
+            "球员 matchups 不是对象列表",
+        ),
+        (LIVE_BOX, ("homeTeam", "statistics"), "球队 statistics 不是 JSON 对象"),
+        (
+            LIVE_BOX,
+            ("homeTeam", "players", 0, "statistics"),
+            "球员 statistics 不是 JSON 对象",
+        ),
+    ],
+)
+def test_response_field_errors_keep_original_messages(resource, path, message, invalid):
+    raw = payload(resource)
+    target = raw[resource.root]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = invalid
+    # An empty object is a valid statistics value.
+    if path[-1] == "statistics" and invalid == {}:
+        inspect_response(resource, raw, GAME)
+    else:
+        with pytest.raises(ResponseValidationError) as caught:
+            inspect_response(resource, raw, GAME)
+        assert str(caught.value) == message
+
+
+def test_optional_rosters_and_matchups_keep_original_empty_counts():
+    resource = BY_NAME["box_score_advanced_v3"]
+    raw = payload(resource)
+    for side in ("homeTeam", "awayTeam"):
+        del raw[resource.root][side]["players"]
+        raw[resource.root][side]["statistics"] = {}
+    assert inspect_response(resource, raw, GAME) == 0
+
+    resource = BY_NAME["box_score_matchups_v3"]
+    raw = payload(resource)
+    for side in ("homeTeam", "awayTeam"):
+        del raw[resource.root][side]["players"][0]["matchups"]
+    assert inspect_response(resource, raw, GAME) == 0
+
+
+def test_profile_parameter_failure_is_isolated_and_preserves_old_file(
+    tmp_path, monkeypatch
+):
+    from nba_api.stats.endpoints.commonplayerinfo import CommonPlayerInfo
+
+    run(tmp_path)
+    path = tmp_path / GAME / PROFILE.relative_path(2)
+    before = path.read_bytes()
+    original = CommonPlayerInfo.__init__
+
+    def build(self, *args, **kwargs):
+        if kwargs.get("player_id") == 2:
+            raise KeyError("private endpoint details")
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CommonPlayerInfo, "__init__", build)
+    report, transport = run(tmp_path, force=True)
+    entry = report["resources"][PROFILE.key(2)]
+    assert entry["status"] == "failed"
+    assert entry["attempts"] == 0
+    assert entry["parameters"] == {}
+    assert entry["error"] == "NBA API 响应结构不完整"
+    assert entry["retained_previous_file"] == str(PROFILE.relative_path(2))
+    assert PROFILE.key(2) not in transport.calls
+    assert report["resources"][PROFILE.key(3)]["status"] == "success"
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("parameters", "checksum", "accepted"), PROVENANCE_CASES,
+)
+def test_rotation_cache_requires_checksum_and_matching_provenance(
+    tmp_path, parameters, checksum, accepted
+):
+    resource = BY_NAME["game_rotation"]
+    raw = {
+        "resultSets": [
+            dataset(name, ["PERSON_ID"], [[1]]) for name in resource.datasets
+        ]
+    }
+    run(tmp_path, FakeTransport(overrides={resource.name: raw}))
+    path = tmp_path / GAME / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    entry = manifest["resources"][resource.name]
+    entry["parameters"] = parameters
+    if not checksum:
+        entry.pop("sha256")
+    atomic_json(path, manifest)
+    report, transport = run(tmp_path)
+    assert report["resources"][resource.name]["cache_hit"] is accepted
+    assert (resource.name not in transport.calls) is accepted
+
+
+@pytest.mark.parametrize(
+    ("resource", "person_id"), [(PROFILE, 3), (BY_NAME["shot_chart_detail"], None)]
+)
+def test_transport_sends_original_stats_and_profile_parameters(
+    monkeypatch, resource, person_id
+):
+    from nba_api.stats.endpoints.commonplayerinfo import CommonPlayerInfo
+    from nba_api.stats.library.http import NBAStatsHTTP
+
+    expected = (
+        CommonPlayerInfo(player_id=person_id, get_request=False)
+        if person_id is not None
+        else resource.request(GAME)
+    )
+    calls = []
+    raw = payload(resource, person_id=person_id)
+
+    def send(self, **kwargs):
+        calls.append(kwargs)
+        return type("RawResponse", (), {"get_dict": lambda self: raw})()
+
+    monkeypatch.setattr(NBAStatsHTTP, "send_api_request", send)
+    with Transport(timeout=17, proxy="http://127.0.0.1:7890") as transport:
+        response = transport.fetch(resource, GAME, person_id)
+    assert calls == [{
+        "endpoint": expected.endpoint,
+        "parameters": expected.parameters,
+        "timeout": 17,
+        "proxy": "http://127.0.0.1:7890",
+    }]
+    assert response.raw == raw
+    assert response.parameters == expected.parameters
+    assert response.attempts == 1
+
+
+@pytest.mark.parametrize(
+    ("parameters", "checksum", "accepted"), PROVENANCE_CASES,
+)
+def test_legacy_rotation_requires_checksum_and_matching_provenance(
+    tmp_path, parameters, checksum, accepted
+):
+    from nba_game.storage import file_hash, import_legacy
+
+    resource = BY_NAME["game_rotation"]
+    legacy = tmp_path / "output" / GAME
+    source = legacy / "raw" / f"{resource.name}.json"
+    raw = {
+        "resultSets": [
+            dataset(name, ["PERSON_ID"], [[1]]) for name in resource.datasets
+        ]
+    }
+    atomic_json(source, raw)
+    entry = {"parameters": parameters}
+    if checksum:
+        entry["sha256"] = file_hash(source)
+    atomic_json(
+        legacy / "manifest.json",
+        {"game_id": GAME, "resources": {resource.name: entry}},
+    )
+    before = source.read_bytes()
+    destination = tmp_path / "games" / GAME
+    import_legacy(destination, legacy, GAME)
+    assert (destination / resource.relative_path()).exists() is accepted
+    assert source.read_bytes() == before
+
+
+def test_final_consistency_keeps_check_order_and_ignores_unscored_actions():
+    from nba_game.validation import consistency_checks
+
+    payloads = {
+        resource.name: payload(resource) for resource in (*RESOURCES, LIVE_BOX, LIVE_PBP)
+    }
+    for name in ("play_by_play_v3", "live_play_by_play"):
+        payloads[name]["game"]["actions"].append({"description": "no score update"})
+    expected = [f"fields:{name}" for name in KEY_FIELDS]
+    for side in ("homeTeam", "awayTeam"):
+        expected.append(f"final_points:{side}")
+        for name in ("box_score_summary_v3", "live_box_score"):
+            expected.extend([f"score:{name}:{side}", f"team:{name}:{side}"])
+        for name in ("play_by_play_v3", "live_play_by_play"):
+            expected.append(f"score:{name}:{side}")
+    expected.append("shotchart_matches_boxscore_fga")
+    assert consistency_checks(payloads, True) == [
+        {"name": name, "status": "passed"} for name in expected
+    ]
+    assert consistency_checks(payloads, False) == [
+        {"name": "final_consistency", "status": "skipped", "reason": "比赛尚未确认结束"}
+    ]
+    del payloads["box_score_traditional_v3"]
+    assert consistency_checks(payloads, True) == [
+        {"name": "final_consistency", "status": "skipped", "reason": "传统统计缺失"}
+    ]
+
+
+@pytest.mark.parametrize("complete_player", [False, True])
+def test_required_statistics_need_one_complete_player_on_each_team(complete_player):
+    from nba_game.validation import consistency_checks
+
+    resource = BY_NAME["box_score_advanced_v3"]
+    raw = payload(resource)
+    team = raw[resource.root]["homeTeam"]
+    complete = copy.deepcopy(team["players"][0])
+    del team["players"][0]["statistics"]["pace"]
+    if complete_player:
+        team["players"].append(complete)
+    checks = consistency_checks(
+        {resource.name: raw, RESOURCES[1].name: payload(RESOURCES[1])}, True
+    )
+    assert checks[0] == {
+        "name": f"fields:{resource.name}",
+        "status": "passed" if complete_player else "failed",
+    }

@@ -97,6 +97,13 @@ PROFILE = Resource(
 )
 
 
+def build_profile_request(person_id: int):
+    """Construct current-profile parameters without sending an API request."""
+    from nba_api.stats.endpoints.commonplayerinfo import CommonPlayerInfo
+
+    return CommonPlayerInfo(player_id=person_id, get_request=False)
+
+
 def build_request(resource: Resource, game_id: str):
     season, kind = game_season(game_id)
     kwargs = {"game_id": game_id}
